@@ -1,16 +1,19 @@
+# rename this file to config.py
 database_path="chats.db"
-bot_version=[0,11]
 id_len=[6,15] #min, max
-message_max_len=1000
-message_reply_max_len=40
+nick_repeat_after_min=15
+message_max_len=4000
+message_reply_max_len=25
 attachments_forward=True
-attachments_max_size_mb=5
+attachments_max_size_mb=20
+attachments_buffer_timeout=1
 # TG
 tg_token=''
 tg_bot_tag='messages_mirror_bot'
 tg_admins_ids=[390623928,]
 # VK 
-vk_user_token=''
+vk_group_token=''
 vk_group_id=209831568
+vk_group_admin_user_token=''
 vk_group_tag='messages_mirror_bot'
 vk_admins_ids=[472153219,]

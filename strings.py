@@ -3,6 +3,7 @@ msg_reply_prefix='↪' # ↪ ➥ ⮩ ⤥ ⤷ ⮎ ⮱
 msg_forward=' [⮎ переслано от {forward_from} ]'
 attachment_wall='Запись со стены {wall_from} \n\n{wall_text}'
 attachment_story='История от {first_name} {last_name}'
+attachment_video_description='Видеозапись от {sender_name}'
 attachments_emoji = { # type : icon
     'photo':'🖼',
     'video':'🎦',
@@ -26,9 +27,11 @@ forward_on='Включена'
 forward_off='Выключена'
 time_now='Сейчас'
 time_current='Теперь'
-join_in_chat='Присоеденился(ась) к чату'
-added_in_chat='➕ {added_by} добавляет {added_user} в чат'
-kicked_from_chat='✖️ {kicked_by} удаляет {kicked_user} из чата'
+join_in_chat='Присоеденяется к чату'
+added_in_chat='Добавил {added_user} в чат'
+kicked_from_chat='Удалил {kicked_user} из чата'
+new_chat_name='Изменил название чата на "{chat_new_name}"'
+new_chat_avatar='Изменил аватар чата'
 
 # === команды ===
 cmd_start_private_chat='Привет! Чтобы настроить зеркалирование сообщений из этого чата напишите команду /mirror'
