@@ -1,11 +1,10 @@
 database_path="chats.db"
-bot_version=[0,7]
+bot_version=[0,11]
 id_len=[6,15] #min, max
 message_max_len=1000
-message_reply_max_len=38
+message_reply_max_len=40
 attachments_forward=True
 attachments_max_size_mb=5
-attachments_dir='attachments'
 # TG
 tg_token=''
 tg_bot_tag='messages_mirror_bot'
