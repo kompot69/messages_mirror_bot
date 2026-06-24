@@ -1,46 +1,16 @@
 # rename this file to config.py
-logfile='bot.log'
-database_path='chats.db'
-id_len=[6,45] #min, max
-nick_repeat_after_min=15
-error_notificate_sec=10
-message_max_len=4000
-message_reply_max_len=25
-attachments_forward=True
-attachments_max_size_mb=20
-services = { # при добавлении \ удалении сервиса - нужно пересоздавать БД
-    'tg': {
-        'name': 'Телеграм',
-        'token': '123456:AA',
-        'tag': 'messages_mirror_bot',
-        'link': 't.me/messages_mirror_bot',
-        'admin_ids': [390623928,]
-    },
-    'vk': {
-        'name': 'ВКонтакте',
-        'token': 'vk1.a.Ia',
-        'admin_user_token': 'vk1.a.N1',
-        'admin_ids': [472153219,],
-        'tag': 'messages_mirror_bot',
-        'link': 'vk.me/messages_mirror_bot',
-        'group_id': 209831568,
-    },
-    'dc': {
-        'name': 'Discord',
-        'token': 'MTU',
-        'link': 'm-dc.kompot69.ru',
-        'tag': 'messages_mirror_bot',
-        'admin_ids': [516600769429110804,]
-    }
-}
-import logging
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-formatter = logging.Formatter("%(asctime)s %(levelname)s [%(filename)s:%(lineno)d %(funcName)s]: %(message)s")
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
-if logfile: 
-    file_handler = logging.FileHandler(logfile, mode='w')
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+db_name="chats.db"
+min_id_len=6
+max_id_len=15
+# TG
+token_tg='1234567890:1q2w3e4r5t6y7u8i9opasdfghjklzxcvbnm'
+bot_tag_tg='messages_mirror_bot'
+admins_tg_id=[390623928,]
+# VK 
+token_vk_user='vk1.a.adsofkjgvapdofgjdspoifvhaspokdfjas'
+group_id_vk=209831568
+group_tag_vk='messages_mirror_bot'
+admins_vk_id=[472153219,]
+# messages
+message_max_len=1000
+message_reply_max_len=50
