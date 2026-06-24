@@ -1,19 +1,36 @@
 # rename this file to config.py
 database_path="chats.db"
+
 id_len=[6,15] #min, max
+
 nick_repeat_after_min=15
+
 message_max_len=4000
 message_reply_max_len=25
+
 attachments_forward=True
 attachments_max_size_mb=20
-attachments_buffer_timeout=1
-# TG
-tg_token=''
-tg_bot_tag='messages_mirror_bot'
-tg_admins_ids=[390623928,]
-# VK 
-vk_group_token=''
-vk_group_id=209831568
-vk_group_admin_user_token=''
-vk_group_tag='messages_mirror_bot'
-vk_admins_ids=[472153219,]
+
+services = { # при добавлении \ удалении сервиса - нужно пересоздавать БД
+    'tg': {
+        'name': 'Телеграм',
+        'token': '123456:AA',
+        'tag': 'messages_mirror_bot',
+        'link': 't.me/messages_mirror_bot',
+        'admin_ids': [390623928,]
+    },
+    'vk': {
+        'name': 'ВКонтакте',
+        'token': 'vk1.a.Ia',
+        'admin_user_token': 'vk1.a.N1',
+        'admin_ids': [472153219,],
+        'tag': 'messages_mirror_bot',
+        'link': 'vk.me/messages_mirror_bot',
+        'group_id': 209831568,
+    },
+    'dc': {
+        'name': 'Discord (в разработке)',
+        'tag': '(в разработке)',
+        'link': '(в разработке)'
+    }
+}

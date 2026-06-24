@@ -1,51 +1,78 @@
-import aiosqlite, logging, config
+import aiosqlite, sqlite3, logging, config
 
 loggerDB = logging.getLogger(__name__)
-loggerDB.setLevel(logging.INFO)
-formatterDB = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+loggerDB.setLevel(logging.DEBUG)
+formatterDB = logging.Formatter("%(asctime)s %(levelname)s [%(filename)s:%(lineno)d %(funcName)s]: %(message)s")
 handlerDB = logging.StreamHandler()
 handlerDB.setFormatter(formatterDB)
 loggerDB.addHandler(handlerDB)
 
+def get_columns_names(service):
+    other_services = [key for key in config.services if key != service]
+    other_services_columns = []
+    for other_service in other_services:
+        other_services_columns.append(f'connected_to_{other_service}_id')
+    return [f'chats_{service}', f'{service}_id', other_services_columns]
+
 async def initialization():
+    all_services = [key for key in config.services]
     async with aiosqlite.connect(config.database_path) as db:
-        await db.execute('''CREATE TABLE IF NOT EXISTS chats_tg (
-            tg_id TEXT PRIMARY KEY,
-            connected_to_vk_id TEXT
-            )''') #last_msg_from_id INTEGER,
-        await db.execute('''CREATE TABLE IF NOT EXISTS chats_vk (
-            vk_id TEXT PRIMARY KEY,
-            connected_to_tg_id TEXT
-            )''') #last_msg_from_id INTEGER,
+        async with db.execute("""SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';""") as cursor:
+            rows = await cursor.fetchall()
+            current_tables = [row[0] for row in rows]
+        for service in all_services:
+            if f'chats_{service}' not in current_tables and len(current_tables)>0: loggerDB.warning(f'new service detected: {service}. you may to recreate DB!')
+            other_services_columns = get_columns_names(service)[2]
+            sql = f'CREATE TABLE IF NOT EXISTS chats_{service} ({service}_id TEXT PRIMARY KEY, settings TEXT'
+            for column in other_services_columns: sql += f', {column}'
+            sql += ')'
+            await db.execute(sql) 
         await db.commit()
 
-async def get_table_and_column_name(from_service):
-    if from_service == 'vk': return 'chats_vk', 'vk_id', 'connected_to_tg_id'#, 'last_msg_from_id'
-    elif from_service == 'tg': return 'chats_tg', 'tg_id', 'connected_to_vk_id'#, 'last_msg_from_id'
-
-async def get_connected_chat(from_service, from_chat_id):
-    table, id_col, connected_col = await get_table_and_column_name(from_service)
-    sql = f"""SELECT * FROM {table} WHERE {id_col} = ?"""
+async def get_chat(service, service_chat_id):
+    sql = f"""SELECT * FROM chats_{service} WHERE {service}_id = ?"""
     async with aiosqlite.connect(config.database_path) as db:
-        async with db.execute(sql, (from_chat_id,)) as cursor:
-            result = await cursor.fetchone()
-            loggerDB.debug(f'{from_service} {from_chat_id} connect > {result}')
-            if result: result=result[1]
-            return result
+        async with db.execute(f"PRAGMA table_info(chats_{service});") as cursor:
+            rows = await cursor.fetchall()
+            table_columns = [row[1] for row in rows]
+        async with db.execute(sql, (service_chat_id,)) as cursor:
+            columns_content = await cursor.fetchone()
+        connected_services = {}
+        if columns_content is None: 
+            columns_content = []
+            for i in table_columns: columns_content.append(None)
+        for field, value in zip(table_columns, columns_content):
+            if field == 'settings': chat_settings = value
+            elif field.startswith('connected_to_') and field.endswith('_id'):
+                connected_service = field[len('connected_to_'):-len('_id')]
+                connected_services[connected_service] = value
+        if service_chat_id is not None: loggerDB.debug(f'{service} {service_chat_id} connected_services: {connected_services}, setings: {chat_settings}')
+        return chat_settings, connected_services
     
-async def connect_chats(service_to_connect, chat_to_connect_id, chat_to_be_connected_id):
-    table, id_col, connected_col = await get_table_and_column_name(service_to_connect)
-    sql = f"""INSERT INTO {table} ({id_col}, {connected_col}) VALUES (?, ?) ON CONFLICT({id_col}) DO UPDATE SET {connected_col} = excluded.{connected_col}"""
+async def connect_chats(service0, service0_chat_id, service1, service1_chat_id):
+    columns = get_columns_names(service0)
+    sql = f"""INSERT INTO {columns[0]} ({columns[1]}, connected_to_{service1}_id) VALUES (?, ?) ON CONFLICT({columns[1]}) DO UPDATE SET connected_to_{service1}_id = excluded.connected_to_{service1}_id"""
+    try:
+        async with aiosqlite.connect(config.database_path) as db:
+            await db.execute(sql, (service0_chat_id, service1_chat_id))
+            await db.commit()
+            sql = f"""SELECT connected_to_{service0}_id FROM chats_{service1} WHERE {service1}_id = ?"""
+            async with db.execute(sql, (service1_chat_id,)) as cursor:
+                connected_chat_connected_to_id = await cursor.fetchone()
+                if connected_chat_connected_to_id and service0_chat_id in connected_chat_connected_to_id:
+                    loggerDB.debug(f'chat {service0} {service0_chat_id} was mutually connected to {service1} chat {service1_chat_id}')
+                    return True
+                else: 
+                    loggerDB.debug(f'chat {service0} {service0_chat_id} was connected to {service1} chat {service1_chat_id} (not mutually)')
+                    return False
+    except sqlite3.OperationalError: 
+        loggerDB.debug(f'chat {service0} {service0_chat_id} was try to connect to service {service1}, but service {service1} was not exist')
+        return None
+        
+async def disconnect_chat(service0, service0_chat_id):
+    columns = get_columns_names(service0)
+    sql = f"""DELETE FROM {columns[0]} WHERE {columns[1]} = ?"""
     async with aiosqlite.connect(config.database_path) as db:
-        await db.execute(sql, (chat_to_connect_id, chat_to_be_connected_id))
-        await db.commit()
-        loggerDB.info(f'{service_to_connect} {chat_to_connect_id} was connected to {chat_to_be_connected_id}')
-
-async def disconnect_chat(from_service, from_chat_id):
-    table, id_col, connected_col = await get_table_and_column_name(from_service)
-    sql = f"""DELETE FROM {table} WHERE {id_col} = ?"""
-    async with aiosqlite.connect(config.database_path) as db:
-        await db.execute(sql, (from_chat_id,))
-        loggerDB.debug(sql)
-        loggerDB.info(f'{from_service} {from_chat_id} was disconnected')
+        await db.execute(sql, (service0_chat_id,))
+        loggerDB.debug(f'{service0} {service0_chat_id} was disconnected')
         await db.commit()
