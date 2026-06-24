@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+govno/
+venv/
+.env/
+.gitignore
+*.log
+*.txt
+*.zip
+*.db
+config.py
