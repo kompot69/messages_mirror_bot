@@ -29,7 +29,7 @@ async def get_connected_chat(from_service, from_chat_id):
     async with aiosqlite.connect(config.database_path) as db:
         async with db.execute(sql, (from_chat_id,)) as cursor:
             result = await cursor.fetchone()
-            loggerDB.debug(f'{from_service} {from_chat_id} connected to {result[1]}')
+            loggerDB.debug(f'{from_service} {from_chat_id} connect > {result}')
             if result: result=result[1]
             return result
     
