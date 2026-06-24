@@ -1,11 +1,5 @@
-import aiosqlite, sqlite3, logging, config
-
-loggerDB = logging.getLogger(__name__)
-loggerDB.setLevel(logging.DEBUG)
-formatterDB = logging.Formatter("%(asctime)s %(levelname)s [%(filename)s:%(lineno)d %(funcName)s]: %(message)s")
-handlerDB = logging.StreamHandler()
-handlerDB.setFormatter(formatterDB)
-loggerDB.addHandler(handlerDB)
+import aiosqlite, sqlite3, config
+from config import logger
 
 def get_columns_names(service):
     other_services = [key for key in config.services if key != service]
@@ -21,12 +15,13 @@ async def initialization():
             rows = await cursor.fetchall()
             current_tables = [row[0] for row in rows]
         for service in all_services:
-            if f'chats_{service}' not in current_tables and len(current_tables)>0: loggerDB.warning(f'new service detected: {service}. you may to recreate DB!')
+            if f'chats_{service}' not in current_tables and len(current_tables)>0: logger.warning(f'new service detected: {service}. you may to recreate DB!')
             other_services_columns = get_columns_names(service)[2]
             sql = f'CREATE TABLE IF NOT EXISTS chats_{service} ({service}_id TEXT PRIMARY KEY, settings TEXT'
             for column in other_services_columns: sql += f', {column}'
             sql += ')'
             await db.execute(sql) 
+        # sql = f'CREATE TABLE IF NOT EXISTS attachments_cache ({service}_attachment_id TEXT, {service}_attachment_id TEXT,
         await db.commit()
 
 async def get_chat(service, service_chat_id):
@@ -46,7 +41,7 @@ async def get_chat(service, service_chat_id):
             elif field.startswith('connected_to_') and field.endswith('_id'):
                 connected_service = field[len('connected_to_'):-len('_id')]
                 connected_services[connected_service] = value
-        if service_chat_id is not None: loggerDB.debug(f'{service} {service_chat_id} connected_services: {connected_services}, setings: {chat_settings}')
+        if service_chat_id is not None: logger.debug(f'{service} {service_chat_id} connected_services: {connected_services}, setings: {chat_settings}')
         return chat_settings, connected_services
     
 async def connect_chats(service0, service0_chat_id, service1, service1_chat_id):
@@ -60,13 +55,13 @@ async def connect_chats(service0, service0_chat_id, service1, service1_chat_id):
             async with db.execute(sql, (service1_chat_id,)) as cursor:
                 connected_chat_connected_to_id = await cursor.fetchone()
                 if connected_chat_connected_to_id and service0_chat_id in connected_chat_connected_to_id:
-                    loggerDB.debug(f'chat {service0} {service0_chat_id} was mutually connected to {service1} chat {service1_chat_id}')
+                    logger.debug(f'chat {service0} {service0_chat_id} was mutually connected to {service1} chat {service1_chat_id}')
                     return True
                 else: 
-                    loggerDB.debug(f'chat {service0} {service0_chat_id} was connected to {service1} chat {service1_chat_id} (not mutually)')
+                    logger.debug(f'chat {service0} {service0_chat_id} was connected to {service1} chat {service1_chat_id} (not mutually)')
                     return False
     except sqlite3.OperationalError: 
-        loggerDB.debug(f'chat {service0} {service0_chat_id} was try to connect to service {service1}, but service {service1} was not exist')
+        logger.debug(f'chat {service0} {service0_chat_id} was try to connect to service {service1}, but service {service1} was not exist')
         return None
         
 async def disconnect_chat(service0, service0_chat_id):
@@ -74,5 +69,5 @@ async def disconnect_chat(service0, service0_chat_id):
     sql = f"""DELETE FROM {columns[0]} WHERE {columns[1]} = ?"""
     async with aiosqlite.connect(config.database_path) as db:
         await db.execute(sql, (service0_chat_id,))
-        loggerDB.debug(f'{service0} {service0_chat_id} was disconnected')
+        logger.debug(f'{service0} {service0_chat_id} was disconnected')
         await db.commit()

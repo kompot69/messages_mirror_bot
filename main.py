@@ -1,25 +1,18 @@
-bot_version=[2,0]
-import asyncio, threading, logging, vk_api, requests, subprocess, tempfile, json, os, yt_dlp
+bot_version=[3,1]
+import asyncio, threading, vk_api, requests, tempfile, json, discord, psutil, os
 from datetime import datetime
 from io import BytesIO
 from collections import defaultdict
+from discord.ext import commands
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, BufferedInputFile
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.utils.media_group import MediaGroupBuilder
+#from aiogram.utils.text_decorations import markdown_decoration
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
-import config, db, strings
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-formatter = logging.Formatter("%(asctime)s %(levelname)s [%(filename)s:%(lineno)d %(funcName)s]: %(message)s")
-console_handler = logging.StreamHandler()
-file_handler = logging.FileHandler(f"{__name__}.log", mode='w')
-console_handler.setFormatter(formatter)
-file_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
-logger.addHandler(file_handler)
+import config, db, strings, convert
+from config import logger
 
 buttons_main=[
     ['link', 'FAQ', 'https://'],
@@ -29,57 +22,70 @@ buttons_main=[
     ['payload', 'update']
     ]
 
+chat_last_send = {} # [nick,time]
 
 # = = = COMMANDS = = =
 async def get_chat_name(service, id):
     if service == 'vk': return await vk_get_name(id)
     if service == 'tg': return await tg_get_name(id)
-    if service == 'dc': return 'chat_name'
+    if service == 'dc': return await dc_get_name(id)
 async def check_message_access(service, id):
     if service == 'vk': return await vk_check_message_access(id)
     if service == 'tg': return await tg_check_message_access(id)
     if service == 'dc': return True
     
-async def if_command(service0, service0_msg_text, service0_chat_id, service0_chat_is_private): 
-    service0_msg_text = service0_msg_text.lower()
-    if service0_msg_text.endswith(f'@{config.services[service0]["tag"]}'): service0_msg_text = service0_msg_text[:-(len(config.services[service0]["tag"])+1)]
-    args = service0_msg_text.split(" ")
-    if  service0_msg_text.startswith(('/start', '/mirror')) or (service0_chat_is_private and service0_msg_text in ['/help', 'начать', 'помощь']): 
-        return await main_cmd(service0, service0_chat_id, args)
+async def if_command(service, chat, message): 
+    if not 'text' in message: return False
+    msg_text = message['text'].lower()
+    if msg_text.endswith(f'@{config.services[service]["tag"]}'): msg_text = msg_text[:-(len(config.services[service]["tag"])+1)]
+    args = msg_text.split(" ")
+    if  msg_text.startswith(('/start', '/mirror')) or (chat['is_private'] and msg_text in ['/help', 'начать', 'помощь']): 
+        return await mirror_cmd(service, chat, message, args)
+    if  msg_text.startswith('/getlogs'): 
+        return await getlogs_cmd(service, chat, message)
     else: return False
 
-async def main_cmd(service0, service0_chat_id, args):
-    service0_message_access = await check_message_access(service0, service0_chat_id)
-    if service0_chat_id.isdigit() and int(service0_chat_id) in config.services[service0]['admin_ids']: 
-        bot_ver = ".".join(str(x) for x in bot_version if isinstance(x, int))+" "+" ".join(str(x) for x in bot_version if isinstance(x, str))
-        admin_text = strings.admin_text.format(bot_version=bot_ver.strip(), message_max_len=config.message_max_len)
-    else: admin_text = False 
-    service0_chat_name = await get_chat_name(service0, service0_chat_id)
-    chat_settings, connected_chats = await db.get_chat(service0, service0_chat_id)
+async def getlogs_cmd(service, chat, message):
+    logger.debug(f'command from {chat}')
+    if message['sender']['id'] not in config.services[service]['admin_ids']: return False
+    logger.info(f'getlogs command from {service} admin {message['sender']['id']}')
+    return 'logs will be here'
 
-    if len(args) == 1 : # без аргументов - просмотр статуса
+async def mirror_cmd(service, chat, message, args):
+    logger.debug(f'command from {chat}')
+    message_access = await check_message_access(service, chat['id'])
+    # admin 
+    if message['sender']['id'] in config.services[service]['admin_ids']: 
+        bot_ver = ".".join(str(x) for x in bot_version if isinstance(x, int))+" "+" ".join(str(x) for x in bot_version if isinstance(x, str))
+        mem_usage_current_process = psutil.Process(os.getpid()).memory_info().rss/1024/1024
+        admin_text = f"🔢 Версия: {bot_ver}\n💾Использовано ОП: {mem_usage_current_process:.0f} MB"
+        #admin_text = strings.admin_text.format(bot_version=bot_ver.strip(), message_max_len=config.message_max_len, ram_usage=mem_usage_current_process)
+    else: admin_text = False 
+    if 'name' in chat: service_chat_name = chat['name']
+    else: service_chat_name = await get_chat_name(service, chat['id'])
+    chat_settings, connected_chats = await db.get_chat(service, chat['id_db'])
+    # без аргументов - просмотр статуса
+    if len(args) == 1 : 
         other_services = []
-        for connected_service, connected_id in connected_chats.items(): 
-            connected_service_chat_name = await get_chat_name(connected_service, connected_id)
+        for connected_service, connected_id in connected_chats.items():
+            if connected_id is not None: connected_service_chat_name = await get_chat_name(connected_service, connected_id)
+            else: connected_service_chat_name = None
             connected_chast_settings, connected_chat_connected_chasts = await db.get_chat(connected_service, connected_id)
             if connected_chat_connected_chasts is None: connected_mutually = False
-            elif connected_chat_connected_chasts[service0] == service0_chat_id: connected_mutually = True
+            elif connected_chat_connected_chasts[service] == chat['id_db']: connected_mutually = True
             else: connected_mutually = False
             other_services.append([connected_service, connected_id, connected_service_chat_name, connected_mutually])
-        return strings.cmd_mirror_status(service0, service0_chat_id, other_services, service0_message_access, admin_text)
-    
-    if len(args) != 2 : # больше 1 аргумента
-        return strings.cmd_mirror_connecting(service0, service0_chat_id, 'wrong_id')
-
-    if args[1]=='off' or args[1]=='disconnect': # отвязка
-        chat_settings, connected_chats = await db.get_chat(service0, service0_chat_id)
+        return strings.cmd_mirror_status(service, chat['id_db'], other_services, message_access, admin_text)
+    # больше 1 аргумента
+    if len(args) != 2 : return strings.cmd_mirror_connecting(service, chat['id_db'], 'wrong_id')
+    # отвязка
+    if args[1]=='off' or args[1]=='disconnect':
         for connected_service, connected_id in connected_chats.items(): 
             connected_chast_settings, connected_chat_connected_chasts = await db.get_chat(connected_service, connected_id)
-            if connected_chat_connected_chasts is not None and connected_chat_connected_chasts[service0] == service0_chat_id: 
-                await message_send_queue.put((connected_service, connected_id, strings.chat_disconnected_from.format(service_name=config.services[service0]['name'],service_chat_id=service0_chat_id,service_chat_name=service0_chat_name), None, [service0, service0_chat_id]))
-        await db.disconnect_chat(service0,service0_chat_id)
-        return strings.cmd_mirror_connecting(service0, service0_chat_id, 'disconnect')
-    
+            if connected_chat_connected_chasts is not None and connected_chat_connected_chasts[service] == chat['id_db']: 
+                await message_send_queue.put(([connected_service,connected_id], None, strings.chat_disconnected_from.format(service_name=config.services[service]['name'],service_chat_id=chat['id_db'],service_chat_name=service_chat_name)))
+        await db.disconnect_chat(service,chat['id_db'])
+        return strings.cmd_mirror_connecting(service, chat['id_db'], 'disconnect')
     # с аргументами - настройка привязки
     service1 = args[1][:2]
     service1_chat_id = args[1][2:]
@@ -87,45 +93,41 @@ async def main_cmd(service0, service0_chat_id, args):
     else: tread_id = None
     # проверка валидности
     if service1_chat_id.startswith('-'): #обход для бесед вк
-        if not service1_chat_id[1:].isdigit(): return strings.cmd_mirror_connecting(service0, service0_chat_id, 'wrong_id')
-    elif not service1_chat_id.isdigit(): return strings.cmd_mirror_connecting(service0, service0_chat_id, 'wrong_id')
-    if config.id_len[0] > len(service1_chat_id) or len(service1_chat_id) > config.id_len[1]: return strings.cmd_mirror_connecting(service0, service0_chat_id, 'wrong_id')
-
+        if not service1_chat_id[1:].isdigit(): return strings.cmd_mirror_connecting(service, chat['id_db'], 'wrong_id')
+    elif not service1_chat_id.isdigit(): return strings.cmd_mirror_connecting(service, chat['id_db'], 'wrong_id')
+    if config.id_len[0] > len(service1_chat_id) or len(service1_chat_id) > config.id_len[1]: return strings.cmd_mirror_connecting(service, chat['id_db'], 'wrong_id')
     service1_chat_name = await get_chat_name(service1, service1_chat_id)
-    connected_mutually = await db.connect_chats(service0, service0_chat_id, service1, (service1_chat_id+'tread'+tread_id if tread_id else service1_chat_id)) # привязка 
-    if connected_mutually is None: return strings.cmd_mirror_connecting(service0, service0_chat_id, 'wrong_id')
+    connected_mutually = await db.connect_chats(service, chat['id_db'], service1, (service1_chat_id+'tread'+tread_id if tread_id else service1_chat_id)) # привязка 
+    if connected_mutually is None: return strings.cmd_mirror_connecting(service, chat['id_db'], 'wrong_id')
     if connected_mutually == True: 
-        await message_send_queue.put((service1, service1_chat_id, strings.chat_connected_to.format(service_name=config.services[service0]['name'],service_chat_id=service0_chat_id,service_chat_name=service0_chat_name), None, [service0, service0_chat_id]))
+        await message_send_queue.put(([service1, service1_chat_id], None, strings.chat_connected_to.format(service_name=config.services[service]['name'],service_chat_id=chat['id_db'],service_chat_name=service_chat_name)))
     if connected_mutually == False: 
-        await message_send_queue.put((service1, service1_chat_id, strings.chat_connect_to_request.format(service_name=config.services[service0]['name'],service_chat_id=service0_chat_id,service_chat_name=service0_chat_name), None, [service0, service0_chat_id]))
-    return strings.cmd_mirror_connecting(service0, service0_chat_id, [service1, (service1_chat_id+'tread'+tread_id if tread_id else service1_chat_id), service1_chat_name], service0_message_access, connected_mutually) 
+        await message_send_queue.put(([service1, service1_chat_id], None, strings.chat_connect_to_request.format(service_name=config.services[service]['name'],service_chat_id=chat['id_db'],service_chat_name=service_chat_name)))
+    return strings.cmd_mirror_connecting(service, chat['id_db'], [service1, (service1_chat_id+'tread'+tread_id if tread_id else service1_chat_id), service1_chat_name], message_access, connected_mutually) 
 
-# = = = MESSAGES BUFFER, SENDER, NAVIGATOR = = =
+# = = = MESSAGES BUFFER, SENDER, NAVIGATOR, CONSTRUCTOR = = =
 
 message_buffer = defaultdict(list)
 message_buffer_timers = {} 
 message_buffer_queue = asyncio.Queue()
 async def message_buffer_worker():
     while True:
-        service_to, to_id, message, attachments, from_chat = await message_buffer_queue.get()
-        if not attachments or len(attachments[0]) < 5: # если без вложений или вложение не групповое  
-            await message_send_queue.put((service_to, to_id, message, attachments, from_chat))
+        service_to, service_from, message = await message_buffer_queue.get()
+        if isinstance(message, str) or 'attachments' not in message or all('group_id' not in a for a in message['attachments']): # просто текст / без вложений / вложения не групповые
+            await message_send_queue.put((service_to, service_from, message))
             continue
-        group_id = attachments[0][4]
-        if not group_id: # group_id некорректен 
-            await message_send_queue.put((service_to, to_id, message, attachments, from_chat))
-            continue
-        logger.debug(f'new attachments for group_id {group_id}: {attachments}')
-
-        if group_id in message_buffer: 
-            existing_attachments = message_buffer[group_id][3] # add new attachments to old
-            existing_attachments.extend(attachments)
-            attachments = existing_attachments
-            if message[2] == '': message = message_buffer[group_id][1]
-            message_buffer[group_id] = [service_to, to_id, message, existing_attachments, from_chat]
+        group_id = f'{message['attachments'][0]['group_id']}_to_{service_to[0]}'
+        logger.debug(f'new attachments with group_id {group_id}: {message['attachments']}')
+        if group_id in message_buffer: # добавляем вложения (другое - если есть - перезаписываем) к старому объекту
+            existing_message_obj = message_buffer[group_id][2]
+            existing_message_obj['attachments'].extend(message['attachments'])
+            if 'text' in message and message['text'] is not None: existing_message_obj['text'] = message['text']
+            if 'text_format' in message: existing_message_obj['text_format'] = message['text_format']
+            if 'forward_from' in message: existing_message_obj['forward_from'] = message['forward_from']
+            if 'reply_to_message' in message: existing_message_obj['reply_to_message'] = message['reply_to_message']
+            message_buffer[group_id] = [service_to, service_from, existing_message_obj]
         else:
-            message_buffer[group_id] = [service_to, to_id, message, list(attachments), from_chat]
-
+            message_buffer[group_id] = [service_to, service_from, message]
         if group_id in message_buffer_timers: message_buffer_timers[group_id].cancel() # cancel old timer
         message_buffer_timers[group_id] = asyncio.create_task(message_buffer_timer(group_id)) # start new timer
 
@@ -134,8 +136,8 @@ async def message_buffer_timer(group_id: str):
         await asyncio.sleep(1) # attachments_buffer_timeout
         logger.debug(f'its time to send attachments group: {group_id}')
         if group_id in message_buffer:
-            service_to, to_id, message, attachments, from_chat = message_buffer[group_id]
-            await message_send_queue.put((service_to, to_id, message, attachments, from_chat))
+            service_to, service_from, message = message_buffer[group_id]
+            await message_send_queue.put((service_to, service_from, message))
             del message_buffer[group_id]
             del message_buffer_timers[group_id]
     except asyncio.CancelledError: pass
@@ -143,198 +145,333 @@ async def message_buffer_timer(group_id: str):
         logger.error(f'timer error for group {group_id}: {e}', exc_info=True)
         del message_buffer[group_id]
 
-async def notifiacte_message(service_to, to_id, error_attachment_name=None, tread=None):
-    if error_attachment_name: text = strings.notificate_attachments_error.format(attachment=error_attachment_name)
-    if service_to == 'vk': message = vk_group_api.messages.send(peer_id=to_id, message=text, random_id=0)
-    elif service_to == 'tg': message = await tg_bot.send_message(to_id, text, message_thread_id=tread) 
-    elif service_to == 'dc': pass
-    await asyncio.sleep(5)
-    if service_to == 'vk': vk_group_api.messages.delete(message_ids=message, delete_for_all=1)
-    elif service_to == 'tg': await tg_bot.delete_message(chat_id=to_id,message_id=message.message_id) 
-    elif service_to == 'dc': pass
+async def message_notifiacte(service_to, text, tread=None):
+    logger.debug(f'notificate {service_to}')
+    if 'tread' in service_to[1]: service_to[1], tread = service_to[1].split('tread')
+    if service_to[0] == 'vk': message = vk_group_api.messages.send(peer_id=service_to[1], message=text, random_id=0)
+    elif service_to[0] == 'tg': message = await tg_bot.send_message(service_to[1], text, message_thread_id=tread) 
+    elif service_to[0] == 'dc': message = await (dc_bot.get_channel(tread or service_to[1]) or await dc_bot.fetch_channel(tread or service_to[1])).send(text)         
+    await asyncio.sleep(config.error_notificate_sec)
+    if service_to[0] == 'vk': vk_group_api.messages.delete(message_ids=message, delete_for_all=1)
+    elif service_to[0] == 'tg': await tg_bot.delete_message(chat_id=service_to[1],message_id=message.message_id) 
+    elif service_to[0] == 'dc': await message.delete()
 
 message_send_queue = asyncio.Queue()
 async def message_sender(): 
-    chat_last_send = {} # [nick,time]
     while True:
-        service_to, to_id, message, attachments, service_from = await message_send_queue.get()
-        logger.info(f"sending message to {service_to} {to_id}: {message if isinstance(message, list) else message.replace(chr(10), '  ')} {attachments if attachments else ''}")
+        service_to, service_from, message = await message_send_queue.get()
 
-        if isinstance(message, list):
-            last = chat_last_send.get(service_to+str(to_id))
-            if last: 
-                if message[1] == last[0] and (datetime.now()-last[1]).total_seconds()/60 <= config.nick_repeat_after_min: 
-                    message_text = message[0]+message[2]
-                else: message_text = message[0]+message[1]+message[2]
-            else: message_text = message[0]+message[1]+message[2]
-            chat_last_send[service_to+str(to_id)] = [message[1],datetime.now()]
-        else: message_text = message
+        if 'tread' in str(service_to[1]): service_to[1], tread = service_to[1].split('tread')
+        else: tread = None
 
-        if service_to == 'tg': 
-            try: 
-                if 'tread' in to_id: to_id, tread = to_id.split('tread')
-                else: tread = None
-                
-                if message_text and not attachments: 
-                    await tg_bot.send_message(to_id, message_text, message_thread_id=tread, parse_mode='MarkdownV2') 
-                
-                elif attachments:
-                    group_id = False
-                    if len(attachments[0])>4 and len(attachments)>1: 
-                        if attachments[0][4]: group_id = attachments[0][4] 
-                    if group_id: media_group = MediaGroupBuilder(caption=message_text)
-
-                    for attachment in attachments: # [attachment_type, file_name, file_size, bytes]
-                        if attachment[3] is None and attachment[0] not in ['wall','link']:
-                            await notifiacte_message(service_from[0], service_from[1], error_attachment_name=attachment[1], tread=tread)
-                            if attachment[2] is not None and attachment[2] != 0:
-                                await tg_bot.send_message(to_id, f'{message_text+"\n" if message_text else ""}{strings.attachments_emoji[attachment[0]]} {attachment[1]} ({round(attachment[2]/1024/1024,2)}МБ)', message_thread_id=tread, parse_mode='MarkdownV2')
-                            else:
-                                await tg_bot.send_message(to_id, f'{message_text+"\n" if message_text else ""}{strings.attachments_emoji[attachment[0]]} {attachment[1]}', message_thread_id=tread, parse_mode='MarkdownV2')
-                        else:
-                            try:
-                                if attachment[0] == 'photo': 
-                                    if group_id: media_group.add_photo(media=attachment[3])
-                                    else: await tg_bot.send_photo(to_id, attachment[3], caption=message_text, message_thread_id=tread)
-                                elif attachment[0] == 'video': 
-                                    if group_id: media_group.add_video(media=attachment[3])
-                                    else: await tg_bot.send_video(to_id, attachment[3], caption=message_text, message_thread_id=tread)
-                                elif attachment[0] == 'audio': 
-                                    await tg_bot.send_audio(to_id, attachment[3], caption=message_text, message_thread_id=tread)
-                                elif attachment[0] == 'doc': 
-                                    if group_id: media_group.add_document(media=attachment[3])
-                                    else: await tg_bot.send_document(to_id, attachment[3], caption=message_text, message_thread_id=tread)
-                                elif attachment[0] == 'sticker' or attachment[0] == 'graffiti' : 
-                                    await tg_bot.send_sticker(to_id, attachment[3], message_thread_id=tread)
-                                elif attachment[0] == 'audio_message': 
-                                    await tg_bot.send_voice(to_id, attachment[3], message_thread_id=tread)
-                                elif attachment[0] == 'video_message': 
-                                    await tg_bot.send_video_note(to_id, attachment[3], message_thread_id=tread)
-                                elif attachment[0] == 'location': 
-                                    if message_text: await tg_bot.send_message(to_id, message_text, message_thread_id=tread) 
-                                    await tg_bot.send_location(to_id, latitude=attachment[3][0], longitude=attachment[3][1], message_thread_id=tread)
-                                elif attachment[0] == 'wall': 
-                                    await tg_bot.send_message(to_id, f'{message_text+"\n" if message_text else ""}{strings.attachments_emoji["wall"]} {attachment[1]}', message_thread_id=tread)
-                                elif attachment[0] == 'story': 
-                                    await tg_bot.send_message(to_id, f'{message_text+"\n" if message_text else ""}{strings.attachments_emoji["story"]} {attachment[1]}', message_thread_id=tread)
-                                elif attachment[0] == 'poll': 
-                                    poll = f'{message_text+"\n" if message_text else ""}{strings.attachments_emoji["poll"]} {attachment[1]}'
-                                    for option in attachment[3]: poll += f'\n ● {option}'
-                                    await tg_bot.send_message(to_id, poll, message_thread_id=tread)
-                                else: 
-                                    await tg_bot.send_message(to_id, f'{message_text+"\n" if message_text else ""}{strings.attachments_emoji["unknown"]} {attachment[1]}', message_thread_id=tread)
-                            except Exception as e: 
-                                logger.error(e, exc_info=True)
-                                await notifiacte_message(service_from[0], service_from[1], error_attachment_name=attachment[1], tread=tread)
-                                await tg_bot.send_message(to_id, f'{message_text+"\n" if message_text else ""}{strings.attachments_emoji[attachment[0]]} {attachment[1]}', message_thread_id=tread)
-                    if group_id: 
-                        await tg_bot.send_media_group(to_id, media=media_group.build())
-
-            except TelegramForbiddenError as e: logger.warning(f'error send to {service_to} {to_id}: {e}')
-            except Exception as e: logger.error(e,exc_info=True)
-
-        elif service_to == 'vk': 
-            try: 
-                if not attachments: vk_group_api.messages.send( peer_id=to_id, message=message_text, random_id=0)
-                vk_attachments = []
-                group_id = False
-                if attachments: # [attachment_type, file_name, file_size, bytes]
-                    if len(attachments[0])>4 and len(attachments)>1: 
-                        if attachments[0][4]: group_id = attachments[0][4] 
-                    for attachment in attachments:                         
-                        # отправка вложений (текст)
-                        if attachment[0] == 'location': 
-                            vk_group_api.messages.send( peer_id=to_id, lat=attachment[3][0], long=attachment[3][1], random_id=0)
-                        elif attachment[0] == 'poll': 
-                            poll = f'{strings.attachments_emoji["poll"]} {attachment[1]}'
-                            for option in attachment[3]: poll += f'\n ● {option}'
-                            vk_group_api.messages.send( peer_id=to_id, message=poll, random_id=0 )
-                        elif attachment[0] == 'contact':
-                            vk_group_api.messages.send( peer_id=to_id, message = f'{strings.attachments_emoji["contact"]} {attachment[1]}\n{attachment[3]}', random_id=0 )
-                        else: # отправка вложений (файлы)
-                            if attachment[2] is not None and attachment[2] != 0 and isinstance(attachment[2], (int, float)): 
-                                attachment_size = f'({round(attachment[2]/1024/1024,2)}МБ)' 
-                            else: attachment_size = ''
-                            if attachment[3] is None: 
-                                vk_attachment = False
-                            elif attachment[0] == 'photo' or attachment[0] == 'sticker': 
-                                vk_attachment = await vk_attachment_upload(file_photo=attachment[3])
-                            elif attachment[0] == 'video' or attachment[0] == 'video_message': 
-                                vk_attachment = await vk_attachment_upload(file_video=attachment[3], to_id=to_id, name=attachment[1], video_description=strings.attachment_video_description.format(sender_name=message[1]+message[2]))
-                            elif attachment[0] == 'story': 
-                                vk_attachment = False
-                            elif attachment[0] == 'doc': 
-                                vk_attachment = await vk_attachment_upload(file_doc=attachment[3], to_id=to_id, name=attachment[1])
-                            elif attachment[0] == 'gif': 
-                                vk_attachment = await vk_attachment_upload(file_gif=attachment[3], to_id=to_id, name=attachment[1])
-                            elif attachment[0] == 'audio': 
-                                vk_attachment = await vk_attachment_upload(file_audio=attachment[3], to_id=to_id, name=attachment[1])
-                            elif attachment[0] == 'audio_message': 
-                                vk_attachment = await vk_attachment_upload(file_audio_message=attachment[3], to_id=to_id, name=attachment[1])
-                            else: 
-                                vk_attachment = False
-
-                            if vk_attachment == False:
-                                attachments_emoji = strings.attachments_emoji.get(attachment[0], strings.attachments_emoji["unknown"])
-                                vk_group_api.messages.send( peer_id=to_id, message=f'{message_text+"\n" if message_text and not group_id else ""}{attachments_emoji} {attachment[1]} {attachment_size}', random_id=0)
-                                await notifiacte_message(service_from[0], service_from[1], error_attachment_name=attachment[1])
-                            elif group_id: vk_attachments.append(vk_attachment)
-                            elif message_text: vk_group_api.messages.send(peer_id=to_id, message=message_text, random_id=0, attachment=vk_attachment)
-                            else: vk_group_api.messages.send(peer_id=to_id, random_id=0, attachment=vk_attachment)
-                if group_id:
-                    if not message_text: vk_group_api.messages.send( peer_id=to_id, random_id=0, attachment=vk_attachments)
-                    else: vk_group_api.messages.send( peer_id=to_id, message=message_text, random_id=0, attachment=vk_attachments)
-
-            except vk_api.exceptions.ApiError as e: logger.warning(f'error send to {service_to} {to_id}: {e}', exc_info=True)
-            except Exception as e: logger.error(e, exc_info=True)
-
-async def message_navigator(service0, msg_obj):
-    try:
-        logger.debug(f'message from {service0} catched: {str(msg_obj)}')
-        # parsing
-        if service0 == 'tg': service0_chat_id, service0_user_id, service0_user_nick, service0_msg_text, reply_to_msg_text, attachment_list, service0_chat_is_private, is_invite = await tg_parse_message(msg_obj)
-        elif service0 == 'vk': service0_chat_id, service0_user_id, service0_user_nick, service0_msg_text, reply_to_msg_text, attachment_list, service0_chat_is_private, is_invite = await vk_parse_message(msg_obj)
-        logger.info(f"new message from {service0} {service0_chat_id}: {service0_msg_text.replace(chr(10), '  ')} {str(attachment_list) if attachment_list else ''}")
-
-        # command / invite answer 
-        command_answer = await if_command(service0, service0_msg_text, service0_chat_id, service0_chat_is_private)
-        if command_answer is not None and command_answer != False: 
-            return await message_send_queue.put((service0, service0_chat_id, command_answer, None, [service0, service0_chat_id]))
-        elif is_invite: 
-            logger.info(f'bot was invited to {service0_chat_id} {service0} chat')
-            return await message_send_queue.put((service0, service0_chat_id, strings.welcome_message, None, [service0, service0_chat_id]))
+        message_text, message_attachments, attachments_with_errors = await message_constructor(service_to, service_from, message)
+        logger.info(f'sending message to {service_to}: {message_text.replace(chr(10), '  ') if message_text else ""} {message_attachments if message_attachments else ""}')
         
+        try:
+            if service_to[0] == 'dc': 
+                if tread: dc_channel = dc_bot.get_channel(service_to[1]) or await dc_bot.fetch_channel(service_to[1])
+                else: dc_channel = dc_bot.get_channel(service_to[1]) or await dc_bot.fetch_channel(service_to[1])
+            if isinstance(message, str): 
+                if service_to[0] == 'tg': await tg_bot.send_message(service_to[1], message_text, message_thread_id=tread) 
+                if service_to[0] == 'vk': vk_group_api.messages.send(peer_id=service_to[1], message=message_text, random_id=0)
+                if service_to[0] == 'dc': await dc_channel.send(message_text)
+            elif message_text and not message_attachments: 
+                if service_to[0] == 'tg': await tg_bot.send_message(service_to[1], message_text, message_thread_id=tread) 
+                if service_to[0] == 'vk': vk_group_api.messages.send(peer_id=service_to[1], message=message_text, random_id=0)
+                if service_to[0] == 'dc': await dc_channel.send(message_text)
+            else:
+                group_id = False
+                if 'group_id' in message_attachments[0] and len(message_attachments)>1: 
+                    group_id = message_attachments[0]['group_id']
+
+                if service_to[0] == 'tg':
+                    if group_id: uploaded_attachments = MediaGroupBuilder(caption=message_text)
+                    for attachment in message_attachments:
+                        try:
+                            if 'bytes' in attachment and attachment['bytes']: 
+                                attachment['bytes'].seek(0)
+                                attachment_bytes = BufferedInputFile(attachment['bytes'].getvalue(), attachment['file_name'])
+                            if attachment['type'] == 'photo': 
+                                if group_id: uploaded_attachments.add_photo(media=attachment_bytes)
+                                else: await tg_bot.send_photo(service_to[1], attachment_bytes, caption=message_text, message_thread_id=tread)
+                            elif attachment['type'] in ['video','sticker_video']: 
+                                if group_id: uploaded_attachments.add_video(media=attachment_bytes)
+                                else: await tg_bot.send_video(service_to[1], attachment_bytes, caption=message_text, message_thread_id=tread)
+                            elif attachment['type'] == 'audio': 
+                                await tg_bot.send_audio(service_to[1], attachment_bytes, caption=message_text, message_thread_id=tread)
+                            elif attachment['type'] in ['doc','gif','sticker_animated']: 
+                                if group_id: uploaded_attachments.add_document(media=attachment_bytes)
+                                else: await tg_bot.send_document(service_to[1], attachment_bytes, caption=message_text, message_thread_id=tread)
+                            elif attachment['type'] in ['graffiti','sticker']: 
+                                await tg_bot.send_sticker(service_to[1], attachment_bytes, message_thread_id=tread)
+                            elif attachment['type'] == 'audio_message': 
+                                await tg_bot.send_voice(service_to[1], attachment_bytes, caption=message_text, message_thread_id=tread)
+                            elif attachment['type'] == 'video_message': 
+                                await tg_bot.send_video_note(service_to[1], attachment_bytes, message_thread_id=tread)
+                            elif attachment['type'] == 'location': 
+                                if message_text: await tg_bot.send_message(service_to[1], message_text, message_thread_id=tread) 
+                                await tg_bot.send_location(service_to[1], latitude=attachment['file_name'][0], longitude=attachment['file_name'][1], message_thread_id=tread)
+                            else: 
+                                await tg_bot.send_message(service_to[1], f'{message_text+"\n" if message_text else ""}{strings.attachments_emoji["unknown"]} {attachment['file_name']}', message_thread_id=tread)
+                        except Exception as e: 
+                            logger.error(e, exc_info=True)
+                            attachments_with_errors.append(attachment)
+                    if group_id: await tg_bot.send_media_group(service_to[1], media=uploaded_attachments.build()) 
+                        
+                elif service_to[0] == 'vk':
+                    uploaded_attachments = []
+                    for attachment in message_attachments:
+                        if 'bytes' in attachment and attachment['bytes']: attachment['bytes'].seek(0)
+                        try:
+                            vk_attachment = None
+                            if attachment['type'] == 'location': 
+                                vk_group_api.messages.send(peer_id=service_to[1], lat=attachment['file_name'][0], long=attachment['file_name'][1], random_id=0)
+                            elif attachment['type'] in ['photo','sticker']: 
+                                vk_attachment = await vk_attachment_upload(file_photo=attachment['bytes'])
+                            elif attachment['type'] in ['video','video_message','sticker_video']: 
+                                vk_attachment = await vk_attachment_upload(file_video=attachment['bytes'], to_id=service_to[1], name=attachment['file_name'], video_description=strings.attachment_video_description.format(sender_name=message['sender']['name']))
+                            elif attachment['type'] in ['doc','sticker_animated']: 
+                                vk_attachment = await vk_attachment_upload(file_doc=attachment['bytes'], to_id=service_to[1], name=attachment['file_name'])
+                            elif attachment['type'] == 'gif': 
+                                vk_attachment = await vk_attachment_upload(file_gif=attachment['bytes'], to_id=service_to[1], name=attachment['file_name'])
+                            elif attachment['type'] == 'audio': 
+                                vk_attachment = await vk_attachment_upload(file_audio=attachment['bytes'], to_id=service_to[1], name=attachment['file_name'])
+                            elif attachment['type'] == 'audio_message': 
+                                vk_attachment = await vk_attachment_upload(file_audio_message=attachment['bytes'], to_id=service_to[1], name=attachment['file_name'])
+                            if not vk_attachment: raise Exception('attachment was empty')
+                            if group_id: uploaded_attachments.append(vk_attachment)
+                            elif message_text: vk_group_api.messages.send(peer_id=service_to[1], message=message_text, random_id=0, attachment=vk_attachment)
+                            else: vk_group_api.messages.send(peer_id=service_to[1], random_id=0, attachment=vk_attachment)
+                        except Exception as e:
+                            logger.error(e, exc_info=True)
+                            attachments_with_errors.append(attachment)
+                            vk_group_api.messages.send(peer_id=service_to[1], message=message_text, random_id=0)
+                    if group_id:
+                        if message_text: vk_group_api.messages.send(peer_id=service_to[1], message=message_text, random_id=0, attachment=uploaded_attachments)
+                        else: vk_group_api.messages.send(peer_id=service_to[1], random_id=0, attachment=uploaded_attachments)
+
+                elif service_to[0] == 'dc':
+                    uploaded_attachments = []
+                    try:
+                        for attachment in message_attachments:
+                            if 'bytes' in attachment and attachment['bytes']: 
+                                attachment['bytes'].seek(0)
+                                uploaded_attachments.append(discord.File(attachment["bytes"], filename=attachment["file_name"]))
+                            else: attachments_with_errors.append(attachment)
+                        if message_text: await dc_channel.send(content=message_text, files=uploaded_attachments)
+                        else: await dc_channel.send(files=uploaded_attachments)
+                    except Exception as e:
+                        if '413 Payload Too Large (error code: 40005): Request entity too large' in str(e): logger.warning(f'cannot send file to dc: {e}')
+                        else: logger.error(e, exc_info=True)
+                        attachments_with_errors.extend(message_attachments)
+
+                if 'uploaded_attachments' in locals(): del uploaded_attachments
+                if attachments_with_errors:
+                    logger.debug(f'attachments with errors: {attachments_with_errors}')
+                    notifiacte = strings.notificate_attachments_error.format(service_to=config.services[service_to[0]]['name'])
+                    message_text = message_text if message_text else ''
+                    for attachment in attachments_with_errors: 
+                        if attachment['type'] in strings.attachments_emoji: 
+                            message_text += f"\n{strings.attachments_emoji[attachment['type']]} {attachment['file_name']}"
+                            notifiacte += f"\n{strings.attachments_emoji[attachment['type']]} {attachment['file_name']}"
+                        else: 
+                            message_text = f"\n{strings.attachments_emoji['unknown']} {attachment['file_name']}"
+                            notifiacte = f"\n{strings.attachments_emoji['unknown']} {attachment['file_name']}"
+                        if attachment['size'] is not None and isinstance(attachment['size'], (int, float)): 
+                            message_text += f" ({round(attachment['size']/1024/1024,2)}МБ)"
+                            notifiacte += f" ({round(attachment['size']/1024/1024,2)}МБ)"
+                    if service_from is not None: await message_notifiacte(service_from, notifiacte, tread=tread)
+                    await message_send_queue.put((service_to, service_from, message_text))
+
+        except Exception as e: logger.error(f'error send to {service_to[0]} {service_to[1]}: {e}', exc_info=True)
+        
+async def message_constructor(service_to, service_from, message):
+    try:
+        if isinstance(message, str): return message, None, [] # simple text
+        if 'text' in message and message['text'] is not None: constructor_text = message['text']
+        else: constructor_text = ''
+
+        constructor_reply = ''
+        if 'reply_to_message' in message:
+            if 'text' in message['reply_to_message'] and message['reply_to_message']['text'] is not None and len(message['reply_to_message']['text'])>0:
+                constructor_reply = message['reply_to_message']['text']
+                if constructor_reply.startswith(strings.msg_reply_prefix): constructor_reply = constructor_reply[constructor_reply.find('\n')+1:] # обрезка реплаев в реплаях
+                if constructor_reply.startswith(strings.msg_nick_prefix): constructor_reply = constructor_reply[constructor_reply.find('\n')+1:] # обрезка ников в реплаях
+                if len(constructor_reply)>config.message_reply_max_len: constructor_reply = constructor_reply[:config.message_reply_max_len-3].strip()+'...' # обрезка длины
+                constructor_reply = f'{strings.msg_reply_prefix} {constructor_reply.replace("\n", " ")}'
+            elif 'attachments' in message['reply_to_message']:
+                constructor_reply = f'{strings.msg_reply_prefix} {strings.attachments_emoji[message['reply_to_message']['attachments'][0]['type']]} {message['reply_to_message']['attachments'][0]['type']}'
+
+        constructor_sender = ''
+        last_send = chat_last_send.get(f'{service_to[0]}{service_to[1]}') # sender_name, last_send_time
+        if last_send: 
+            if not (message['sender']['name'] == last_send[0] and (datetime.now()-last_send[1]).total_seconds()/60 <= config.nick_repeat_after_min):
+                constructor_sender = strings.msg_nick_prefix + message['sender']['name']
+        else: constructor_sender = strings.msg_nick_prefix + message['sender']['name']
+        chat_last_send[f'{service_to[0]}{service_to[1]}'] = [message['sender']['name'],datetime.now()]
+
+        constructor_forward = ''
+        if 'forward_from' in message: 
+            if 'name' in message['forward_from']: constructor_forward = strings.msg_forward.format(forward_from=message['forward_from']['name'])
+            elif service_from is not None: 
+                name = await get_chat_name(service_from[0], message['forward_from']['id'])
+                if name: constructor_forward = strings.msg_forward.format(forward_from=(name))
+                else: constructor_forward = strings.msg_forward.format(forward_from=message['forward_from']['id'])
+
+        constructor_attachments = ''
+        message_attachments = []
+        attachments_with_errors = []
+        if 'attachments' in message:
+            for attachment in message['attachments']:
+                if attachment['type'] == 'contact': 
+                    constructor_attachments += f'\n{strings.attachments_emoji["contact"]} {attachment['file_name'][0]}\n{attachment['file_name'][1]}'
+                elif attachment['type'] == 'link': 
+                    constructor_attachments += f'\n{strings.attachments_emoji["link"]} {attachment['file_name']}'
+                elif attachment['type'] == 'wall': 
+                    constructor_attachments += f'\n{strings.attachments_emoji["wall"]} {attachment['file_name']}'
+                elif attachment['type'] == 'story': 
+                    constructor_attachments += f'\n{strings.attachments_emoji["story"]} {attachment['file_name']}'
+                elif attachment['type'] == 'poll': 
+                    constructor_attachments += f'\n{strings.attachments_emoji["poll"]} {attachment['file_name'][0]}'
+                    for option in attachment['file_name'][0]:
+                        constructor_attachments += f'\n ● {option}'
+                elif (not 'bytes' in attachment or attachment['bytes'] is None) and attachment['type'] not in ['location']:
+                    if attachment['type'] in strings.attachments_emoji: 
+                        constructor_attachments += f'\n{strings.attachments_emoji[attachment['type']]} {attachment['file_name']}'
+                    else: 
+                        constructor_attachments += f'\n{strings.attachments_emoji['unknown']} {attachment['file_name']}'
+                    if attachment['size'] is not None and isinstance(attachment['size'], (int, float)): 
+                        constructor_attachments += f'({round(attachment['size']/1024/1024,2)}МБ)' 
+                    attachments_with_errors.append(attachment)
+                else:
+                    message_attachments.append(attachment)
+        message_text = ''
+        for e in [constructor_reply, constructor_sender, constructor_forward, constructor_text, constructor_attachments]:
+            if e and len(e)>0: message_text += f'\n{e}'
+        if len(message_text) > config.message_max_len: message_text = message_text[:config.message_max_len]+"\n [ ... ]"
+        if message_text is None or len(message_text)==0: message_text=None
+        return message_text, message_attachments, attachments_with_errors
+    except Exception as e: logger.error(e, exc_info=True)
+
+async def message_navigator(service_from, msg_obj):
+    try:
+        logger.debug(f"message from {service_from} catched: {'(wait to re-request vk message)' if service_from=='vk' else str(msg_obj) }")
+        # parsing
+        if service_from == 'tg': message, chat = await tg_parse_message(msg_obj)
+        elif service_from == 'vk': 
+            rr_msg_obj = vk_group_api.messages.getByConversationMessageId(peer_id=msg_obj['peer_id'], conversation_message_ids=[msg_obj['conversation_message_id']])['items'] # vk govno
+            if isinstance(msg_obj, (list,dict)): msg_obj = rr_msg_obj[0]
+            else: logger.warning(f'rr_msg_obj is not a list or dict, using original msg_obj...')
+            logger.debug(f're-requested vk message: {rr_msg_obj}')
+            message, chat = await vk_parse_message(msg_obj)
+        elif service_from == 'dc': message, chat = await dc_parse_message(msg_obj)
+        logger.info(f"new message from {service_from} {chat}: {message}")
+        if not chat or not message: return logger.error('error while parsing detected')
+        # command / invite answer 
+        command_answer = await if_command(service_from, chat, message)
+        if command_answer is not None and command_answer != False: 
+            return await message_send_queue.put(([service_from, chat['id_db']], None, command_answer))
+        elif 'if_invite' in chat and chat['if_invite']: 
+            logger.info(f'bot was invited to {service_from} {chat['id']}  chat')
+            return await message_send_queue.put(([service_from, chat['id_db']], None, strings.welcome_message))
         # connect check 
-        chat_settings, connected_chats = await db.get_chat(service0, service0_chat_id)
+        chat_settings, connected_chats = await db.get_chat(service_from, chat['id_db'])
         chats_to_send = {}
         for connected_service, connected_id in connected_chats.items():
             if connected_id: # подключенный чат
                 connected_chat_settings, connected_chat_connected_chats = await db.get_chat(connected_service, connected_id)
-                if service0_chat_id in connected_chat_connected_chats.values(): # подключенный чат подкючен к этому
+                if chat['id_db'] in connected_chat_connected_chats.values(): # подключенный чат подкючен к этому
                     chats_to_send[connected_service] = connected_id
-                    logger.debug(f'чат {service0} {service0_chat_id} подключен к чату {connected_service} c ID {connected_id}')
-                else: logger.debug(f'чат {service0} {service0_chat_id} невзаимно подключен к чату {connected_service} c ID {connected_id}')
-            else: logger.debug(f'чат {service0} {service0_chat_id} не подключен к чату {connected_service}')
-        if not chats_to_send:
-            if service0_chat_is_private: 
-                return await message_send_queue.put((service0, service0_chat_id, strings.chat_has_no_connected_chats, None, [service0, service0_chat_id]))
-                #await message_send_queue.put((service0, service0_chat_id, strings.cmd_mirror_status(service0,), None, [service0, service0_chat_id])) # other_services service: [cutag, chat_id, chat_name]
-
-        # replys 
-        if reply_to_msg_text:
-            if reply_to_msg_text.startswith(strings.msg_reply_prefix): reply_to_msg_text=reply_to_msg_text[reply_to_msg_text.find('\n')+1:] # обрезка реплаев в реплаях
-            if reply_to_msg_text.startswith(strings.msg_nick_prefix): reply_to_msg_text=reply_to_msg_text[reply_to_msg_text.find('\n')+1:] # обрезка ников в реплаях
-            if len(reply_to_msg_text)>config.message_reply_max_len: reply_to_msg_text = reply_to_msg_text[:config.message_reply_max_len-3]+'...' # обрезка длины
-            reply_to_msg_text = reply_to_msg_text.replace("\n", " ")
-            reply_to_msg_text = f'{strings.msg_reply_prefix} {reply_to_msg_text}\n'
-
-        # sending
-        if len(service0_msg_text) > config.message_max_len: service0_msg_text=service0_msg_text[:config.message_max_len]+"\n [ ... ]"
-        message = [reply_to_msg_text or '', f'{strings.msg_nick_prefix} {service0_user_nick}\n', service0_msg_text]
+                    logger.debug(f'чат {service_from} {chat['id_db']} подключен к чату {connected_service} c ID {connected_id}')
+                else: logger.debug(f'чат {service_from} {chat['id_db']} невзаимно подключен к чату {connected_service} c ID {connected_id}')
+            else: logger.debug(f'чат {service_from} {chat['id_db']} не подключен к чату {connected_service}')
+        if not chats_to_send and chat['is_private']: 
+            return await message_send_queue.put(([service_from, chat['id_db']], None, strings.chat_has_no_connected_chats))
         for service, to_id in chats_to_send.items():
-            await message_buffer_queue.put((service, to_id, message, attachment_list, [service0, service0_chat_id])) 
+            await message_buffer_queue.put(([service, to_id], [service_from, chat['id_db']], message)) 
     except Exception as e: logger.error(e, exc_info=True)
 
+# = = = = = DC = = = = =
+
+async def dc_get_name(id): 
+    if 'tread' in id: id = id.split('tread')[0]
+    channel = dc_bot.get_channel(id) or await dc_bot.fetch_channel(id)
+    #logger.debug(channel)
+    if isinstance(channel, discord.DMChannel): return channel.recipient.global_name
+    if channel is None: return None
+    return channel.name
+
+async def dc_parse_message(msg_obj, reply_parse=False): 
+    try:
+        #if True:#getattr(msg_obj, 'reference', None):
+        #    for attr in dir(msg_obj):
+        #        if not attr.startswith("_"):
+        #            try:
+        #                value = getattr(msg_obj, attr)
+        #                logger.debug(f'{attr} = {value}')
+        #            except Exception: pass
+        chat = {}
+        chat['id'] = msg_obj.channel.id
+        chat['id_db'] = str(msg_obj.channel.id)
+        chat['is_private'] = True if isinstance(msg_obj.channel, discord.DMChannel) else False
+        if chat['is_private']: chat['name'] = msg_obj.author.global_name
+        else: chat['name'] = msg_obj.channel.guild.name
+        if getattr(msg_obj.channel, 'category_id', None): # msg_obj.tread # msg_obj.category_id
+            chat['id_db'] = f'{msg_obj.channel.id}tread{msg_obj.channel.category_id}'
+            chat['tread'] = {'id':msg_obj.channel.category_id, 'name':msg_obj.channel.name}#.name
+        message = {}
+        message['id'] = msg_obj.id
+        message['sender'] = {'id':msg_obj.author.id}
+        if getattr(msg_obj.author, 'nick', None): message['sender']['name'] = msg_obj.author.nick
+        elif getattr(msg_obj.author, 'global_name', None): message['sender']['name'] = msg_obj.author.global_name
+        elif getattr(msg_obj.author, 'display_name', None): message['sender']['name'] = msg_obj.author.display_name
+        else: message['sender']['name'] = None
+        if getattr(msg_obj, 'clean_content', None): message['text'] = msg_obj.clean_content #content
+        if getattr(msg_obj, 'type', None):
+            if msg_obj.type == discord.MessageType.reply: 
+                message['reply_to_message'], reply_to_message_chat = await dc_parse_message(msg_obj.reference.resolved, reply_parse=True)
+            elif msg_obj.type == discord.MessageType.default and getattr(msg_obj, 'reference', None) and msg_obj.reference.type == discord.MessageReferenceType.forward:
+                try: 
+                    fwd_msg = await msg_obj.channel.fetch_message(msg_obj.reference.message_id)
+                    fwd_msg, fwd_chat = await dc_parse_message(fwd_msg)
+                    logger.debug(f'forward message = {fwd_msg}')
+                    message['forward_from'] = {'id': fwd_msg['sender']['id'], 'name': fwd_msg['sender']['name']}
+                    if 'text' in fwd_msg: message['text'] = fwd_msg['text']
+                except discord.errors.NotFound:
+                    #fwd_channel = await dc_bot.fetch_channel(msg_obj.reference.channel_id)
+                    #fwd_msg = await fwd_channel.fetch_message(msg_obj.reference.message_id)
+                    logger.debug('forward message not found')
+                    message['forward_from'] = {'id': None, 'name': None}
+                    message['text'] = '[message not found]'
+            if msg_obj.type == discord.MessageType.recipient_add: message['if_invite']=True
+            if msg_obj.type == discord.MessageType.new_member: message['text'] = strings.action_join_in_chat
+            if msg_obj.type == discord.MessageType.channel_name_change: message['text'] = strings.action_chat_title_update
+            if msg_obj.type == discord.MessageType.channel_icon_change: message['text'] = strings.action_chat_photo_update
+        #if msg_obj.poll
+        if msg_obj.stickers: logger.debug(f'msg_obj.stickers = {msg_obj.stickers}')
+        if getattr(msg_obj, 'attachments', None): 
+            message["attachments"] = []
+            if len(msg_obj.attachments)>1: group_id = f'{chat['id']}_{message['id']}'
+            else: group_id = None
+            for attachment in msg_obj.attachments:
+                logger.debug(f'attachment.content_type={attachment.content_type}')
+                att = {}
+                match attachment.content_type:
+                    case 'image/webp': att['type'] = 'photo'
+                    case 'video/quicktime': att['type'] = 'video'
+                    case 'audio/ogg': att['type'] = 'audio_message'
+                    case _: att['type'] = 'doc'
+                att['file_name'] = attachment.filename
+                att['size'] = attachment.size
+                if config.attachments_forward and att['size']/1024/1024 < config.attachments_max_size_mb and not reply_parse:
+                    att['bytes'] = BytesIO(await attachment.read())
+                    att['bytes'].seek(0)
+                if group_id: att['group_id'] = group_id
+                message["attachments"].append(att)
+        return message, chat
+    except Exception as e:
+        logger.error(e, exc_info=True)
+        return None, None
 
 # = = = = = TG = = = = =
 
@@ -354,185 +491,151 @@ async def tg_get_name(id):
     except Exception as e:
         logger.warning(f'error while getting name for id {id}: {e}')
         return '[неизвестно]'
-    
-async def tg_parse_message(msg_obj):
+
+async def tg_download_attachment(attachment, reply_parse=False, type=None): 
+    # for photo, video, video_note, animation, audio, voice, document, sticker
+    logger.debug(f'attachment = {attachment}')
+    file = None
+    file_size = getattr(attachment, 'file_size', None)
+    need_extension = False
+    if getattr(attachment, 'file_name', False): file_name = attachment.file_name
+    elif type in ['photo','sticker']: file_name = f"{type}_{attachment.file_unique_id}.png"
+    elif type in ['sticker_video']: file_name = f"sticker_video_{attachment.file_unique_id}.webm"
+    elif type in ['sticker_animated']: file_name = f"sticker_{attachment.file_unique_id}.tgs"
+    elif type in ['video','video_message']: file_name = f"{type}_{attachment.file_unique_id}.mp4"
+    else: 
+        file_name = f'attachment_{attachment.file_unique_id}'
+        if getattr(attachment, 'mime_type', False): file_name += f"_{attachment.mime_type.split('/')[1]}"
+        else: need_extension = True
+    try: 
+        if config.attachments_forward and file_size/1024/1024 < config.attachments_max_size_mb and not reply_parse:
+            file = BytesIO()
+            file_obj = await tg_bot.get_file(attachment.file_id) 
+            if need_extension: file_name += f"_{attachment.file_path.split('.')[1]}"
+            await tg_bot.download_file(file_obj.file_path, destination=file)
+            file.seek(0)
+    except TelegramBadRequest as e: 
+        logger.warning(e)
+        file = None
+    except Exception as e: 
+        logger.error(e, exc_info=True)
+        file = None
+    return file_name, file_size, file
+
+async def tg_parse_message(msg_obj, reply_parse=False):
     try:
-        attachment_list=[]
-        tg_chat_id = str(msg_obj.chat.id)
-        tg_user_id = msg_obj.from_user.id
-        if msg_obj.message_thread_id: tg_chat_id += f'tread{str(msg_obj.message_thread_id)}'
-        tg_msg_text = getattr(msg_obj, 'md_text', False) or getattr(msg_obj, 'md_caption', False) or '' # msg_obj.text msg_obj.html_text msg_obj.md_text
-        tg_chat_is_private = msg_obj.chat.type == 'private'
-        tg_user_nick = f"{msg_obj.from_user.first_name} {msg_obj.from_user.last_name}" if msg_obj.from_user.last_name else msg_obj.from_user.first_name
+        message={'sender':{}}
+        chat={}
+        attachment={}
+        chat['id'] = int(msg_obj.chat.id)
+        chat['id_db'] = str(msg_obj.chat.id)
+        chat['name'] = msg_obj.chat.title or f'{msg_obj.chat.first_name} {msg_obj.chat.last_name if msg_obj.chat.last_name else ''}'
+        chat['is_private'] = True if msg_obj.chat.type=='private' else False
+        if msg_obj.chat.is_forum and msg_obj.message_thread_id: 
+            chat['id_db'] = f"{chat['id']}tread{msg_obj.message_thread_id}"
+            chat['tread']={}
+            chat['tread']['id'] = int(msg_obj.message_thread_id)
+            if msg_obj.reply_to_message and msg_obj.reply_to_message.forum_topic_created: chat['tread']['name'] = msg_obj.reply_to_message.forum_topic_created.name
+        message['id'] = int(msg_obj.message_id)
+        message['sender']['id'] = int(msg_obj.from_user.id)
+        message['sender']['name'] = f"{msg_obj.from_user.first_name} {msg_obj.from_user.last_name}" if msg_obj.from_user.last_name else msg_obj.from_user.first_name
+        message['text'] = getattr(msg_obj, 'text', False) or getattr(msg_obj, 'caption', False) or '' # msg_obj . text html_text md_text
         # --- action parse --- 
-        is_invite = False
         if msg_obj.new_chat_members: # invite check
             for user in msg_obj.new_chat_members:
-                if config.services['tg']['tag'] == user.username and int(config.services['tg']['token'].split(':')[0]) == user.id: is_invite = True
-                else: tg_msg_text = strings.action_join_in_chat
-        if getattr(msg_obj, 'left_chat_participant', False):
-            tg_msg_text = strings.action_kicked_from_chat.format(kicked_user=msg_obj.left_chat_participant['first_name'])
+                if int(config.services['tg']['token'].split(':')[0]) == user.id: chat['if_invite'] = True
+                else: message['text'] = strings.action_join_in_chat
+        if getattr(msg_obj, 'left_chat_participant', False): 
+            if msg_obj.left_chat_participant['id'] == message['sender']['id']: message['text'] = strings.action_left_from_chat
+            else: message['text'] = strings.action_chat_kick_user.format(kicked_user=msg_obj.left_chat_participant['first_name'])
+        if getattr(msg_obj, 'chat_owner_left', False): message['text'] = strings.action_chat_without_owner_admin
+        if getattr(msg_obj, 'new_chat_title', False): message['text'] = strings.action_chat_title_update.format(new_chat_name=msg_obj.new_chat_title)
+        if getattr(msg_obj, 'new_chat_photo', False): 
+            message['text'] = strings.action_chat_photo_update
+            attachment['file_name'], attachment['size'], attachment['bytes'] = await tg_download_attachment(msg_obj.new_chat_photo[-1], reply_parse)
+            attachment['type'] = 'photo'
         # reply / forward parse 
-        reply_to_msg_text = getattr(msg_obj.reply_to_message, 'text', None) or getattr(msg_obj.reply_to_message, 'caption', None)
-        if getattr(msg_obj, 'reply_to_message') and reply_to_msg_text is None: 
-            if msg_obj.reply_to_message.photo: reply_to_msg_text = f"{strings.attachments_emoji['photo']} photo"
-            if msg_obj.reply_to_message.video: reply_to_msg_text = f"{strings.attachments_emoji['video']} video"
-            if msg_obj.reply_to_message.animation: reply_to_msg_text = f"{strings.attachments_emoji['gif']} gif"
-            if msg_obj.reply_to_message.audio: reply_to_msg_text = f"{strings.attachments_emoji['audio']} audio"
-            if msg_obj.reply_to_message.document: reply_to_msg_text = f"{strings.attachments_emoji['doc']} document"
-            if msg_obj.reply_to_message.sticker: reply_to_msg_text = f"{strings.attachments_emoji['sticker']} sticker"
-            if msg_obj.reply_to_message.voice: reply_to_msg_text = f"{strings.attachments_emoji['audio']} audio_message"
-            if msg_obj.reply_to_message.video_note: reply_to_msg_text = f"{strings.attachments_emoji['video_message']} video_message"
-            if msg_obj.reply_to_message.story: reply_to_msg_text = f"{strings.attachments_emoji['story']} story"
-            if msg_obj.reply_to_message.location: reply_to_msg_text = f"{strings.attachments_emoji['location']} location"
-            if msg_obj.reply_to_message.poll: reply_to_msg_text = f"{strings.attachments_emoji['poll']} poll"
-            if msg_obj.reply_to_message.contact: reply_to_msg_text = f"{strings.attachments_emoji['contact']} contact"
-        if msg_obj.forward_from or getattr(msg_obj, 'forward_sender_name', None) or getattr(msg_obj, 'forward_from_chat', None):
-            forward_from_name='unknown'
-            if getattr(msg_obj, 'forward_sender_name', None): forward_from_name = msg_obj.forward_sender_name
-            elif getattr(msg_obj.forward_from, 'first_name', None) and getattr(msg_obj.forward_from, 'last_name', None): forward_from_name=f'{msg_obj.forward_from.first_name} {msg_obj.forward_from.last_name}'
-            elif getattr(msg_obj.forward_from, 'first_name', None): forward_from_name=msg_obj.forward_from.first_name
-            elif getattr(msg_obj, 'forward_from_chat', None): forward_from_name=msg_obj.forward_from_chat.title
-            tg_user_nick += strings.msg_forward.format(forward_from=forward_from_name)
-        # attachment parse [attachment_type, file_name, file_size, bytes]
+        if msg_obj.reply_to_message:
+            message['reply_to_message'], reply_chat = await tg_parse_message(msg_obj.reply_to_message, reply_parse=True)
+        if msg_obj.forward_from: 
+            message['forward_from']={}
+            message['forward_from']['id'] = msg_obj.forward_from.id
+            message['forward_from']['name'] = f'{msg_obj.forward_from.first_name} {msg_obj.forward_from.last_name if msg_obj.forward_from.last_name else ""}'
+        elif msg_obj.forward_from_chat: 
+            message['forward_from']={}
+            message['forward_from']['id'] = msg_obj.forward_from_chat.id
+            message['forward_from']['name'] = msg_obj.forward_from_chat.title or f'{msg_obj.forward_from_chat.first_name} {msg_obj.forward_from_chat.last_name if msg_obj.forward_from_chat.last_name else ""}'
+        elif msg_obj.forward_sender_name: 
+            message['forward_from']={}
+            message['forward_from']['name'] = msg_obj.forward_sender_name
         if msg_obj.photo: 
-            try: 
-                file = None
-                file_size = msg_obj.photo[-1].file_size
-                file_name = f"photo{msg_obj.photo[-1].file_unique_id}"
-                if config.attachments_forward and file_size/1024/1024 < config.attachments_max_size_mb:
-                    file = BytesIO()
-                    file_obj = await tg_bot.get_file(msg_obj.photo[-1].file_id)
-                    file_name = f"photo{file_obj.file_unique_id}.{file_obj.file_path.split('.')[1]}"
-                    await tg_bot.download_file(file_obj.file_path, destination=file)
-                    file.seek(0)
-            except Exception as e: logger.warning(e, exc_info=True)
-            if msg_obj.media_group_id: attachment_list.append(['photo', file_name, file_size, file, msg_obj.media_group_id])
-            else: attachment_list.append(['photo', file_name, file_size, file])
+            attachment['file_name'], attachment['size'], attachment['bytes'] = await tg_download_attachment(msg_obj.photo[-1], reply_parse, 'photo')
+            attachment['type'] = 'photo'
         if msg_obj.video: 
-            try: 
-                file = None
-                file_size = msg_obj.video.file_size
-                file_name = msg_obj.video.file_name or f"video{msg_obj.video.file_unique_id}"
-                if config.attachments_forward and file_size/1024/1024 < config.attachments_max_size_mb:
-                    file = BytesIO()
-                    file_obj = await tg_bot.get_file(msg_obj.video.file_id)
-                    file_name = msg_obj.video.file_name or f"video{file_obj.file_unique_id}.{file_obj.file_path.split('.')[1]}"
-                    await tg_bot.download_file(file_obj.file_path, destination=file)
-                    file.seek(0)
-            except TelegramBadRequest as e: logger.warning(f'cannot get video from tg: {e}')
-            except Exception as e: logger.warning(e, exc_info=True)
-            if msg_obj.media_group_id: attachment_list.append(['video', file_name, file_size, file, msg_obj.media_group_id])
-            else: attachment_list.append(['video', file_name, file_size, file])
-        if msg_obj.animation: 
-            file_obj = await tg_bot.get_file(msg_obj.animation.file_id)
-            file_name = msg_obj.animation.file_name or f"gif{msg_obj.animation.file_unique_id}.{msg_obj.document.mime_type.split('/')[1]}"
-            file_size = msg_obj.animation.file_size
-            if config.attachments_forward and file_size/1024/1024 < config.attachments_max_size_mb:
-                try: 
-                    file = BytesIO()
-                    await tg_bot.download_file(file_obj.file_path, destination=file)
-                    file.seek(0)
-                except Exception as e:
-                    logger.warning(e, exc_info=True)
-                    file = None
-            else: file = None
-            attachment_list.append(['gif', file_name, file_size, file])
-        if msg_obj.audio:
-            file_name = msg_obj.audio.file_name
-            file_size = msg_obj.audio.file_size
-            if config.attachments_forward and file_size/1024/1024 < config.attachments_max_size_mb:
-                try: 
-                    file_obj = await tg_bot.get_file(msg_obj.audio.file_id)
-                    file = BytesIO()
-                    await tg_bot.download_file(file_obj.file_path, destination=file)
-                    file.seek(0)
-                except Exception as e:
-                    logger.warning(e, exc_info=True)
-                    file = None
-            else: file = None
-            attachment_list.append(['audio', file_name, file_size, file])
-        if msg_obj.document and not msg_obj.animation: 
-            file_name = msg_obj.document.file_name
-            file_size = msg_obj.document.file_size
-            if config.attachments_forward and file_size/1024/1024 < config.attachments_max_size_mb:
-                try: 
-                    file_obj = await tg_bot.get_file(msg_obj.document.file_id)
-                    file = BytesIO()
-                    await tg_bot.download_file(file_obj.file_path, destination=file)
-                    file.seek(0)
-                except Exception as e:
-                    logger.warning(e, exc_info=True)
-                    file = None
-            else: file = None
-            att_type = 'gif' if file_name.endswith('.gif') else 'doc'
-            if msg_obj.media_group_id: attachment_list.append([att_type, file_name, file_size, file, msg_obj.media_group_id])
-            else: attachment_list.append([att_type, file_name, file_size, file])
-        if msg_obj.sticker:
-            file_obj = await tg_bot.get_file(msg_obj.sticker.file_id)
-            file_name = f"sticker{msg_obj.sticker.file_unique_id}.{file_obj.file_path.split('.')[1]}" 
-            file_size = msg_obj.sticker.file_size
-            file_type='sticker'
-            if msg_obj.sticker.is_animated: file_type='doc'
-            if msg_obj.sticker.is_video: file_type='video'
-            if config.attachments_forward and file_size/1024/1024 < config.attachments_max_size_mb:
-                try: 
-                    file = BytesIO()
-                    await tg_bot.download_file(file_obj.file_path, destination=file)
-                    file.seek(0)
-                except Exception as e:
-                    logger.warning(e, exc_info=True)
-                    file = None
-            else: file = None
-            attachment_list.append([file_type, file_name, file_size, file])
-        if msg_obj.voice: 
-            file_name = f"audio_message{msg_obj.voice.file_unique_id}.ogg" 
-            file_size = msg_obj.voice.file_size
-            if config.attachments_forward and file_size/1024/1024 < config.attachments_max_size_mb:
-                try: 
-                    file_obj = await tg_bot.get_file(msg_obj.voice.file_id)
-                    file = BytesIO()
-                    await tg_bot.download_file(file_obj.file_path, destination=file)
-                    file.seek(0)
-                except Exception as e:
-                    logger.warning(e, exc_info=True)
-                    file = None
-            else: file = None
-            attachment_list.append(['audio_message', file_name, file_size, file])
+            attachment['file_name'], attachment['size'], attachment['bytes'] = await tg_download_attachment(msg_obj.video, reply_parse, 'video')
+            attachment['type'] = 'video'
         if msg_obj.video_note: 
-            file_obj = await tg_bot.get_file(msg_obj.video_note.file_id)
-            file_name = f"video_message{msg_obj.video_note.file_unique_id}.mp4" 
-            file_size = msg_obj.video_note.file_size
-            if config.attachments_forward and file_size/1024/1024 < config.attachments_max_size_mb:
-                try: 
-                    file = BytesIO()
-                    await tg_bot.download_file(file_obj.file_path, destination=file)
-                    file.seek(0)
-                except Exception as e:
-                    logger.warning(e, exc_info=True)
-                    file = None
-            else: file = None
-            attachment_list.append(['video_message', file_name, file_size, file])
+            attachment['file_name'], attachment['size'], attachment['bytes'] = await tg_download_attachment(msg_obj.video_note, reply_parse, 'video_message')
+            attachment['type'] = 'video_message'
+        if msg_obj.animation: 
+            attachment['file_name'], attachment['size'], attachment['bytes'] = await tg_download_attachment(msg_obj.document, reply_parse)
+            attachment['type'] = 'gif'
+        if msg_obj.audio:
+            attachment['file_name'], attachment['size'], attachment['bytes'] = await tg_download_attachment(msg_obj.audio, reply_parse)
+            attachment['type'] = 'audio'
+        if msg_obj.voice:
+            attachment['file_name'], attachment['size'], attachment['bytes'] = await tg_download_attachment(msg_obj.voice, reply_parse)
+            attachment['type'] = 'audio_message'
+        if msg_obj.document and not msg_obj.animation: 
+            attachment['file_name'], attachment['size'], attachment['bytes'] = await tg_download_attachment(msg_obj.document, reply_parse)
+            attachment['type'] = 'gif' if attachment['file_name'].endswith('.gif') else 'doc'
+        if msg_obj.sticker:
+            if msg_obj.sticker.is_animated:
+                attachment['file_name'], attachment['size'], attachment['bytes'] = await tg_download_attachment(msg_obj.sticker, reply_parse, 'sticker_animated')
+                attachment['type'] = 'sticker_animated'
+                if attachment['bytes']: 
+                    attachment['type'] = 'gif'
+                    attachment['file_name'] = attachment['file_name'][:-4]+'.gif'
+                    attachment['bytes'] = await convert.to_gif(tgs=attachment['bytes'])
+            elif msg_obj.sticker.is_video:
+                attachment['file_name'], attachment['size'], attachment['bytes'] = await tg_download_attachment(msg_obj.sticker, reply_parse, 'sticker_video')
+                attachment['type'] = 'sticker_video'
+                if attachment['bytes']: 
+                    attachment['type'] = 'gif'
+                    attachment['file_name'] = attachment['file_name'][:-5]+'.gif'
+                    if attachment['bytes']: attachment['bytes'] = await convert.to_gif(webm=attachment['bytes'])
+            else: 
+                attachment['file_name'], attachment['size'], attachment['bytes'] = await tg_download_attachment(msg_obj.sticker, reply_parse, 'sticker')
+                attachment['type'] = 'sticker'
         if msg_obj.story:
-            file_name = strings.attachment_story.format(first_name=msg_obj.story.chat.first_name, last_name=msg_obj.story.chat.last_name)
-            file_size = None
-            attachment_list.append(['story', file_name, file_size, None])
+            attachment['type'] = 'story'
+            attachment['file_name'] = strings.attachment_story.format(first_name=msg_obj.story.chat.first_name, last_name=msg_obj.story.chat.last_name)
+            attachment['size'] = None
         if msg_obj.location: 
-            attachment_list.append(['location', 'location', 0, [msg_obj.location.latitude, msg_obj.location.longitude]])
+            attachment['type'] = 'location'
+            attachment['file_name'] = [msg_obj.location.latitude, msg_obj.location.longitude]
+            attachment['size'] = None
         if msg_obj.poll: 
             options=[]
             for option in msg_obj.poll.options: options.append(option.text)
-            attachment_list.append(['poll', msg_obj.poll.question, 0, options])
+            attachment['type'] = 'poll'
+            attachment['file_name'] = [msg_obj.poll.question, options]
+            attachment['size'] = None
         if msg_obj.contact: 
             name = ''
             if msg_obj.contact.first_name is not None: name += msg_obj.contact.first_name
             if msg_obj.contact.last_name is not None: name += msg_obj.contact.last_name
-            attachment_list.append(['contact', name, 0, msg_obj.contact.phone_number])
+            attachment['type'] = 'contact'
+            attachment['file_name'] = [name, msg_obj.contact.phone_number]
+            attachment['size'] = None
+        if attachment:
+            if msg_obj.media_group_id: attachment['group_id'] = msg_obj.media_group_id
+            message['attachments'] = [attachment] # по одному в каждом сообщениии
 
-        return tg_chat_id, tg_user_id, tg_user_nick, tg_msg_text, reply_to_msg_text, attachment_list, tg_chat_is_private, is_invite 
-
-    except Exception as e: logger.error(e, exc_info=True)
-
+        return message, chat
+    except Exception as e: 
+        logger.error(e, exc_info=True)
+        return None, None
 
 # = = = = = VK = = = = =
 
@@ -544,15 +647,15 @@ async def vk_check_message_access(chat_id):
 
 async def vk_get_name(id):
     try:
-        if int(id) >= 2000000000:
+        id = int(id)
+        if id >= 2000000000:
             сonversation = vk_group_api.messages.getConversationsById(peer_ids=[id])
-            logger.info(сonversation)
             return сonversation['items'][0]['chat_settings']['title']
-        elif int(id) > 0: 
+        elif id > 0: 
             user = vk_group_api.users.get(user_ids=id)
             return f"{user[0]['first_name']} {user[0]['last_name']}"
         else: 
-            return vk_group_api.groups.getById(group_id=abs('user'))[0]['name']
+            return vk_group_api.groups.getById(group_id=abs(id))[0]['name']
     except Exception as e:
         logger.info(f'error while getting name for id {id}: {e}')
         return '[неизвестно]'
@@ -576,14 +679,9 @@ async def vk_attachment_upload(retry=False, name=None, to_id=None, video_descrip
             file_obj = file_doc if file_doc else file_gif
             file_obj.seek(0)
             upload_url = vk_group_api.docs.getMessagesUploadServer(peer_id=to_id)['upload_url']
-            if file_gif and name.endswith('.mp4'):
-                with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_mp4:
-                    temp_mp4.write(file_obj.getvalue())
-                    process = subprocess.run(["ffmpeg","-i",temp_mp4.name,"-an","-sn","-dn","-t","60","-filter_complex","[0:v]fps=15,scale=320:-1:flags=bilinear,split[a][b];[a]palettegen=max_colors=64:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=2","-loop", "0","-f", "gif","pipe:1",], input=file_obj.getvalue(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-                file_obj = BytesIO(process.stdout)
-                if os.path.exists(temp_mp4.name): os.remove(temp_mp4.name)
-                name = name[:-4] + '.gif'
-                file_obj.seek(0)
+            if file_gif and name.lower().endswith('.mp4'): 
+                name = name[:-4]+'.gif'
+                file_obj = await convert.to_gif(mp4=file_obj)
             r = requests.post(upload_url, files={'file': (name, file_obj)})
             result = r.json()
             if 'file' in result:
@@ -601,197 +699,219 @@ async def vk_attachment_upload(retry=False, name=None, to_id=None, video_descrip
                 return f"audio_message{att['owner_id']}_{att['id']}"
             else: raise ValueError(f'audio/audio_message upload to vk error: {result}')
     
-    except subprocess.CalledProcessError as e: 
-        logger.error(f"FFmpeg error: {e.stderr.decode()}")  # <-- Лог ошибки
     except Exception as e: 
-        if str(e) == '[8] Invalid request: Application is blocked' or "'error': 'wrong_arch_file', 'error_descr': 'wrong_arch_file'" in str(e): 
-            logger.warning(e) # ВК параша
-            retry = True # нет смысла пытаться дальше, так как блокировка от самого ВК
-        else: logger.error(e, exc_info=True)
-        if not retry or (retry and file_video):
+        if "'error': 'no extension found', 'error_descr': 'no extension found'" in str(e) and file_gif: name = name+'.gif' if name else 'file.gif'
+        logger.warning(e) # vk govno
+        if file_video:
+            file_doc = file_video
+            file_video = None
+        if not retry:
             await asyncio.sleep(1)
-            if retry and file_video: 
-                file_doc = file_video
-                file_video = None
             args = {'name': name, 'to_id': to_id, 'video_description': video_description, 'file_photo': file_photo, 'file_video': file_video, 'file_gif': file_gif, 'file_doc': file_doc, 'file_audio': file_audio, 'file_audio_message': file_audio_message}
             args = {k: v for k, v in args.items() if v is not None}
             return await vk_attachment_upload(retry=True,**args)
         else: return False
     
-async def vk_parse_message(msg_obj, fwd_msg_parsing=False):
+async def vk_parse_message(msg_obj):
     try:
-        vk_chat_id = int(msg_obj.get('peer_id', 0))
-        vk_chat_is_private = False if vk_chat_id >= 2000000000 else True
-        vk_msg_text = msg_obj.get('text', '')
-        if vk_msg_text and msg_obj.get('format_data', ''):
-            format_items = msg_obj['format_data']['items']
-            format_items.reverse()
-            for item in format_items:
-                if item['type'] == 'bold': 
-                    vk_msg_text = vk_msg_text[:item['offset']+item['length']] + "*" + vk_msg_text[item['offset']+item['length']:]
-                    vk_msg_text = vk_msg_text[:item['offset']] + "*" + vk_msg_text[item['offset']:]
-                if item['type'] == 'italic': 
-                    vk_msg_text = vk_msg_text[:item['offset']+item['length']] + "_" + vk_msg_text[item['offset']+item['length']:]
-                    vk_msg_text = vk_msg_text[:item['offset']] + "_" + vk_msg_text[item['offset']:]
-                if item['type'] == 'underline':
-                    vk_msg_text = vk_msg_text[:item['offset']+item['length']] + "__" + vk_msg_text[item['offset']+item['length']:]
-                    vk_msg_text = vk_msg_text[:item['offset']] + "__" + vk_msg_text[item['offset']:]
-                if item['type'] == 'url':
-                    vk_msg_text = vk_msg_text[:item['offset']+item['length']] + f"]({item['url']})" + vk_msg_text[item['offset']+item['length']:]
-                    vk_msg_text = vk_msg_text[:item['offset']] + "[" + vk_msg_text[item['offset']:]
-        vk_user_id = msg_obj.get('from_id')
-        vk_user_info = vk_group_api.users.get(user_ids=vk_user_id)
-        if vk_user_info: vk_user_nick = f"{vk_user_info[0]['first_name']} {vk_user_info[0]['last_name']}"
-        else: vk_user_nick = vk_group_api.groups.getById(group_id=abs(vk_user_id))[0]['name']
-        attachment_list=[]
+        chat={}
+        message={'sender':{}}
+        chat['id'] = int(msg_obj.get('peer_id') or msg_obj.get('from_id'))
+        chat['id_db'] = str(msg_obj.get('peer_id') or msg_obj.get('from_id'))
+        chat['is_private'] = False if chat['id'] >= 2000000000 else True
+        message['id'] = int(msg_obj.get('conversation_message_id') or msg_obj.get('id')) 
+        message['sender']['id'] = msg_obj.get('from_id')
+        vk_user_info = vk_group_api.users.get(user_ids=msg_obj.get('from_id'))
+        if vk_user_info: message['sender']['name'] = f"{vk_user_info[0]['first_name']} {vk_user_info[0]['last_name']}"
+        else: message['sender']['name'] = vk_group_api.groups.getById(group_id=abs(msg_obj.get('from_id')))[0]['name']
+        message['text'] = msg_obj.get('text') 
+        if msg_obj.get('text') and msg_obj.get('format_data'): 
+            message['text_format'] = msg_obj['format_data'].get('items')
         # --- action parse --- 
-        is_invite = False 
         if msg_obj.get('action'): 
             action_type = msg_obj.get('action').get('type')
             if action_type == "chat_invite_user": 
-                if msg_obj['action']['member_id'] == -config.services['vk']['group_id']: is_invite = True
-                else: vk_msg_text = strings.action_added_in_chat.format(added_user=vk_get_name(msg_obj['action']['member_id']))
+                if msg_obj['action']['member_id'] == -config.services['vk']['group_id']: chat['if_invite'] = True
+                else: 
+                    if msg_obj['action']['member_id'] == msg_obj.get('from_id'): message['text'] = strings.action_join_in_chat
+                    else: message['text'] = strings.action_chat_invite_user.format(added_user=(await vk_get_name(msg_obj['action']['member_id'])))
+            elif action_type == "chat_invite_user_by_link": message['text'] = strings.action_chat_invite_user_by_link
             elif action_type == "chat_kick_user": 
-                vk_msg_text = strings.action_kicked_from_chat.format(kicked_user=vk_get_name(msg_obj['action']['member_id']))
-            elif action_type == "chat_title_update":
-                vk_msg_text = strings.action_new_chat_name.format(new_chat_name=msg_obj['action']['text'])
-            elif action_type == "chat_title_update":
-                vk_msg_text = strings.action_new_chat_name.format(new_chat_name=msg_obj['action']['text'])
-            elif action_type == "chat_photo_update":
-                vk_msg_text = strings.action_new_chat_avatar
-            else: vk_msg_text += f'\naction: {action_type}'
+                if msg_obj['action']['member_id'] == msg_obj.get('from_id'): message['text'] = strings.action_left_from_chat
+                else: message['text'] = strings.action_chat_kick_user.format(kicked_user=(await vk_get_name(msg_obj['action']['member_id'])))
+            elif action_type == "chat_title_update": message['text'] = strings.action_chat_title_update.format(new_chat_name=msg_obj['action']['text'])
+            elif action_type == "chat_photo_update": message['text'] = strings.action_chat_photo_update
+            elif action_type == "chat_without_owner_admin": message['text'] = strings.action_chat_without_owner_admin
+            elif action_type == "chat_pin_message": message['text'] = strings.action_chat_pin_message
+            elif action_type == "chat_unpin_message": message['text'] = strings.action_chat_unpin_message
+            else: message['text'] = f'ℹ️ action: {action_type}'
         # --- reply parse --- 
         if msg_obj.get('reply_message', False):
-            reply_to_msg_text = msg_obj['reply_message'].get('text')
-            if not reply_to_msg_text and msg_obj['reply_message'].get('attachments', False): 
+            message['reply_to_message']={}
+            message['reply_to_message']['id'] = int(msg_obj['reply_message'].get('conversation_message_id') or msg_obj.get('id'))
+            message['reply_to_message']['text'] = msg_obj['reply_message'].get('text')
+            if not msg_obj['reply_message'].get('text') and msg_obj['reply_message'].get('attachments'): 
+                message['reply_to_message']['attachments'] = []
                 for reply_attachment in msg_obj['reply_message']['attachments']:
-                    if reply_attachment['type'] in strings.attachments_emoji: 
-                        reply_to_msg_text = f"{strings.attachments_emoji[reply_attachment['type']]} {reply_attachment['title'] or reply_attachment['type']}"
-                    else: reply_to_msg_text = f"{strings.attachments_emoji['unknown']} {reply_attachment['title'] or reply_attachment['type']}"
-        else: reply_to_msg_text = None
+                    if 'title' in reply_attachment: message['reply_to_message']['attachments'].append([reply_attachment['type'],reply_attachment['title'],None,None])
+                    else: message['reply_to_message']['attachments'].append([reply_attachment['type'],reply_attachment['type'],None,None])
         # --- forward parse --- 
         for fwd_msg in msg_obj.get('fwd_messages', []):
-            fwd_name, fwd_msg, fwd_attachments = await vk_parse_message(fwd_msg, fwd_msg_parsing=True)
-            for attachment in fwd_attachments:
-                if attachment[0] in strings.attachments_emoji: fwd_msg+=f"\n{strings.attachments_emoji[attachment[0]]} {attachment[1] or attachment['type']}"
-                else: fwd_msg+=f"\n{strings.attachments_emoji['unknown']} {attachment[0]}"
-            vk_msg_text += f"\n{strings.msg_forward.format(forward_from=fwd_name)}{fwd_msg}"
-        # --- attachment parse --- [attachment_type, file_name, file_size, bytes]
-        if msg_obj.get('attachments'): attachment_list = await vk_parse_attachments(msg_obj['attachments'], f'{vk_chat_id}_{vk_user_id}')
-        if msg_obj.get('geo'): attachment_list.append(['location', 'location', 0, [msg_obj.get('geo')['coordinates']['latitude'],msg_obj.get('geo')['coordinates']['longitude']]])
-        # --- return --- 
-        if fwd_msg_parsing: 
-            logger.debug(f'forward message from vk {vk_chat_id} ({vk_user_nick}) parsed: {vk_msg_text} {str(attachment_list) if attachment_list else ""}')
-            return vk_user_nick, ('\n'+vk_msg_text if vk_msg_text else ''), attachment_list
-        return str(vk_chat_id), vk_user_id, vk_user_nick, vk_msg_text, reply_to_msg_text, attachment_list, vk_chat_is_private, is_invite
-    except Exception as e: logger.error(e,exc_info=True)
+            if not message['text']: message['text'] = '' # пихаем в текст, пушо их может быть бесконечно много
+            fwd_message, fwd_chat = await vk_parse_message(fwd_msg)
+            if 'attachments' in fwd_message:
+                for attachment in fwd_message['attachments']:
+                    if attachment['type'] in strings.attachments_emoji: fwd_message['text']+=f"\n{strings.attachments_emoji[attachment['type']]} {attachment['file_name'] or attachment['type']}"
+                    else: fwd_message['text']+=f"\n{strings.attachments_emoji['unknown']} {attachment['type']}"
+            message['text'] += f"\n{strings.msg_forward.format(forward_from=fwd_message['sender']['name'])}{fwd_message['text']}"
+        # --- attachment parse --- [type, file_name, size, bytes]
+        attachment_list=[]
+        if msg_obj.get('attachments'): 
+            attachment_list = await vk_parse_attachments(msg_obj['attachments'], (f'{chat['id']}_{message['id']}' if len(msg_obj['attachments'])>1 else None))
+        if msg_obj.get('geo'): 
+            attachment_list.append({
+                'type':'location',
+                'file_name':[msg_obj.get('geo')['coordinates']['latitude'],msg_obj.get('geo')['coordinates']['longitude']],
+                'size': None
+            })
+        if attachment_list: message['attachments'] = attachment_list
+
+        return message, chat
+    except Exception as e: 
+        logger.error(e,exc_info=True)
+        return None, None
 
 async def vk_parse_attachments(attachment_list, group_id_name=None):
     try:
         group_id = False
         attachment_list_parsed = []
         for attachment in attachment_list: 
+            attachment_parsed = {}
+            attachment_parsed['type'] = attachment['type']
             if attachment['type']=='photo':
                 file_url = attachment["photo"]["orig_photo"]["url"]
-                file_name = f'photo{attachment["photo"]["id"]}.{file_url.split("?")[0].split(".")[-1]}'
-                file_size = requests.get(file_url, stream=True).headers.get('Content-Length')
+                attachment_parsed['file_name'] = f'photo{attachment["photo"]["id"]}.{file_url.split("?")[0].split(".")[-1]}'
+                attachment_parsed['size'] = requests.get(file_url, stream=True).headers.get('Content-Length')
                 if len(attachment)>1: group_id = group_id_name
             elif attachment['type']=='video':
-                video_info = vk_user_api.video.get(videos=f"{attachment['video']['owner_id']}_{attachment['video']['id']}_{attachment['video']['access_key']}")
-                logger.debug(video_info)
-                if 'direct_url' in video_info['items'][0]: 
-                    file_url = video_info['items'][0]['direct_url']
-                    file_name =  video_info['items'][0]['title']
-                    file_size = video_info['items'][0]['duration']*1024*1024/5 # примерная оценка размера видео по его длительности (1c= 200кб)
-                elif attachment['video']['type'] == 'video_message':
-                    file_url = None
-                    file_name = f'video_message{attachment["video"]["id"]}'
-                    file_size = None
-                    attachment['type']=='video_message'
+                video_info = vk_user_api.video.get(videos=f"{attachment['video']['owner_id']}_{attachment['video']['id']}_{attachment['video']['access_key']}")['items'][0]
+                logger.debug(f'video_info = {video_info}')
+                if 'direct_url' in video_info: 
+                    file_url = video_info['direct_url']
+                    attachment_parsed['file_name'] = attachment['video']['title'] or video_info['title']
+                    attachment_parsed['size'] = video_info['duration']*1024*1024/6 # примерная оценка размера видео по его длительности (1c=170кб|120с=20мб)
+                elif video_info['type'] == 'video_message':
+                    file_url = None #video_info['player']
+                    attachment_parsed['file_name'] = attachment['video']['title'] or f'video_message{attachment["video"]["id"]}'
+                    attachment_parsed['size'] = None
+                    attachment['type']='video_message'
                 else:
                     file_url = None
-                    file_name = attachment["video"]["title"] or f'video{attachment["video"]["id"]}'
-                    file_size = None
+                    attachment_parsed['file_name'] = attachment["video"]["title"] or f'video{attachment["video"]["id"]}'
+                    attachment_parsed['size'] = None
+                attachment_parsed['file_name'] = f'{attachment_parsed['file_name']}.mp4'
             elif attachment['type']=='audio':
                 file_url = attachment["audio"]["url"] if attachment["audio"]["url"] != '' else None
-                file_name = f'{attachment["audio"]["artist"]} - {attachment["audio"]["title"]}' # .m3u8
-                if file_url is not None: file_size = requests.get(file_url, stream=True).headers.get('Content-Length')
-                else: file_size = None
+                attachment_parsed['file_name'] = f'{attachment["audio"]["artist"]} - {attachment["audio"]["title"]}' # .m3u8
+                if file_url is not None: attachment_parsed['size'] = requests.get(file_url, stream=True).headers.get('Content-Length')
+                else: attachment_parsed['size'] = None
             elif attachment['type']=='audio_message':
                 file_url = attachment["audio_message"]["link_ogg"]
-                file_name = f'audio_message{attachment["audio_message"]["id"]}.ogg'
-                file_size = requests.get(file_url, stream=True).headers.get('Content-Length')
+                attachment_parsed['file_name'] = f'audio_message{attachment["audio_message"]["id"]}.ogg'
+                attachment_parsed['size'] = requests.get(file_url, stream=True).headers.get('Content-Length')
             elif attachment['type']=='doc':
                 file_url = attachment["doc"]["url"]
-                file_name = attachment["doc"]["title"]
-                file_size = attachment["doc"]["size"]
+                attachment_parsed['file_name'] = attachment["doc"]["title"]
+                attachment_parsed['size'] = attachment["doc"]["size"]
                 if len(attachment)>1: group_id = group_id_name
             elif attachment['type']=='sticker':
-                file_url = attachment["sticker"]["images_with_background"][-1]["url"]
-                file_name = f'sticker{attachment["sticker"]["sticker_id"]}.png'
-                file_size = requests.get(file_url, stream=True).headers.get('Content-Length')
+                animated = False # 'animation_url' in attachment["sticker"]
+                file_url = attachment["sticker"]["animation_url"] if animated else attachment["sticker"]["images_with_background"][-1]["url"]
+                attachment_parsed['file_name'] = f'sticker{attachment["sticker"]["sticker_id"]}.{"tgs" if animated else "png"}'
+                attachment_parsed['size'] = requests.get(file_url, stream=True).headers.get('Content-Length') if not animated else 1
             elif attachment['type']=='graffiti':
                 file_url = attachment["graffiti"]["url"]
-                file_name = f'graffiti{attachment["graffiti"]["id"]}.png'
-                file_size = requests.get(file_url, stream=True).headers.get('Content-Length')
+                attachment_parsed['file_name'] = f'graffiti{attachment["graffiti"]["id"]}.png'
+                attachment_parsed['size'] = requests.get(file_url, stream=True).headers.get('Content-Length')
             elif attachment['type']=='wall':
-                if attachment["wall"]["from"].get('name'): file_name = strings.attachment_wall.format(wall_from=attachment["wall"]["from"]["name"], wall_text=attachment["wall"]["text"])
-                elif attachment["wall"]["from"].get('first_name'): file_name = strings.attachment_wall.format(wall_from=f'{attachment["wall"]["from"]["first_name"]} {attachment["wall"]["from"]["last_name"]}', wall_text=attachment["wall"]["text"])
-                else: file_name = strings.attachment_wall.format(wall_from='', wall_text=attachment["wall"]["text"])
+                if 'from' in attachment["wall"]:
+                    if attachment["wall"]["from"].get('name'): attachment_parsed['file_name'] = strings.attachment_wall.format(wall_from=attachment["wall"]["from"]["name"], wall_text=attachment["wall"]["text"])
+                    elif attachment["wall"]["from"].get('first_name'): attachment_parsed['file_name'] = strings.attachment_wall.format(wall_from=f'{attachment["wall"]["from"]["first_name"]} {attachment["wall"]["from"]["last_name"]}', wall_text=attachment["wall"]["text"])
+                    else: attachment_parsed['file_name'] = strings.attachment_wall.format(wall_from='', wall_text=attachment["wall"]["text"])
+                elif 'from_id' in attachment["wall"]: 
+                    wall_from = await vk_get_name(attachment["wall"]['from_id'])
+                    attachment_parsed['file_name'] = strings.attachment_wall.format(wall_from=wall_from, wall_text=attachment["wall"]["text"])
+                else: attachment_parsed['file_name'] = strings.attachment_wall.format(wall_from='', wall_text=attachment["wall"]["text"])
                 if attachment["wall"].get('attachments'):
                     group_id = f'{group_id_name}_{attachment["wall"]["id"]}'
                     for wall_attachment in await vk_parse_attachments(attachment["wall"]['attachments'], group_id_name=group_id): 
                         attachment_list_parsed.append(wall_attachment)
-                file_size = None
+                attachment_parsed['size'] = None
             elif attachment['type']=='story':
-                file_name = strings.attachment_story.format(first_name=attachment["story"]["owner_id"], last_name='')
-                file_size = None
+                attachment_parsed['file_name'] = strings.attachment_story.format(first_name=attachment["story"]["owner_id"], last_name='')
+                attachment_parsed['size'] = None
             elif attachment['type']=='link':
-                file_name = attachment["link"]["url"]
-                file_size = None
+                attachment_parsed['file_name'] = attachment["link"]["url"]
+                attachment_parsed['size'] = None
             elif attachment['type']=='poll':
                 options=[]
                 for option in attachment["poll"]["answers"]: options.append(option["text"])
-                file_name = attachment["poll"]["question"]
-                file_size = None
+                attachment_parsed['file_name'] = attachment["poll"]["question"]
+                attachment_parsed['size'] = None
                 file = options
             else:
-                file_name = attachment["type"]
-                file_size = None
-            if config.attachments_forward and file_size is not None:
-                file_size = int(file_size)
-                #logger.info(f'file_size = {file_size} \nfile_url = {file_url}')
-                if file_size/1024/1024 < config.attachments_max_size_mb and file_size>0 and file_url is not None:
+                attachment_parsed['file_name'] = attachment["type"]
+                attachment_parsed['size'] = None
+            if config.attachments_forward and attachment_parsed['size'] is not None:
+                attachment_parsed['size'] = int(attachment_parsed['size'])
+                if attachment_parsed['size']/1024/1024 < config.attachments_max_size_mb and attachment_parsed['size']>0 and file_url is not None:
                     try: 
-                        if attachment['type']=='audio':
-                            process = subprocess.Popen(["ffmpeg","-i", file_url, "-f", "mp3", "-acodec", "libmp3lame", "-vn", "pipe:1"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                            file = BufferedInputFile(process.stdout.read(),filename=file_name)
-                        elif attachment['type']=='video':
-                            with yt_dlp.YoutubeDL({'outtmpl': 'video.mp4'}) as ydl:
-                                ydl.download([file_url])
-                                with open("video.mp4", "rb") as f:
-                                    video_bytes = f.read()
-                                    file = BufferedInputFile(video_bytes, filename=f"{file_name}.mp4")
-                                    file_size = len(video_bytes)
-                                if os.path.exists("video.mp4"): os.remove("video.mp4")
+                        if attachment['type']=='audio': 
+                            file = BytesIO((await convert.to_mp3(url=file_url)))
+                        elif attachment['type'] in ['video','video_message']:
+                            file = await convert.to_mp4(url_vk=file_url)
+                            attachment_parsed['size'] = len(file)
+                            file = BytesIO(file)
+                        elif attachment['type']=='sticker' and animated:
+                            file = BytesIO((await convert.to_tgs(json_file=requests.get(file_url).content)))
                         else:
-                            file = BufferedInputFile(requests.get(file_url).content,filename=file_name)
+                            file = BytesIO(requests.get(file_url).content)
                     except Exception as e:
                         logger.warning(e, exc_info=True)
                         file = None
                 else: file = None
             elif not attachment['type']=='poll': file = None
-            if group_id: attachment_list_parsed.append([attachment['type'], file_name, file_size, file, group_id])
-            else: attachment_list_parsed.append([attachment['type'], file_name, file_size, file])
+            attachment_parsed['bytes'] = file
+            if group_id: attachment_parsed['group_id'] = group_id
+            attachment_list_parsed.append(attachment_parsed)
         return attachment_list_parsed
     except Exception as e: logger.error(e,exc_info=True)
+
+# === DC catcher ===
+intents = discord.Intents.default()
+intents.message_content = True  # нужно для чтения сообщений
+dc_bot = commands.Bot(command_prefix="/", intents=intents)
+@dc_bot.event
+async def on_reaction_add(reaction, user): logger.debug(reaction, user)
+@dc_bot.event
+async def on_raw_reaction_add(payload): logger.debug(payload)
+#@dc_bot.event
+#async def on_error(event, *args, **kwargs): logger.warning(event, *args)
+#@dc_bot.event
+#async def on_member_join(member): logger.debug(member)
+#@dc_bot.event
+#async def on_raw_member_remove(payload): logger.debug(payload)
+@dc_bot.event
+async def on_message(message):
+    if message.author == dc_bot.user: return
+    await message_navigator(service_from='dc',msg_obj=message)
     
 # === TG catcher ===
 tg_bot = Bot(token=config.services['tg']['token'])
-dp = Dispatcher(storage=MemoryStorage())
-@dp.message()
+tg_dispatcher = Dispatcher(storage=MemoryStorage())
+@tg_dispatcher.message()
 async def handle_telegram_message(message: Message):
-    try: await message_navigator(service0='tg',msg_obj=message)
+    try: await message_navigator(service_from='tg',msg_obj=message)
     except Exception as e: logger.critical(e, exc_info=True)
 # === VK catcher ===
 vk_group_session = vk_api.VkApi(token=config.services['vk']['token'])
@@ -803,12 +923,12 @@ def run_vk_bot_polling(loop):
         for event in VkBotLongPoll(vk_group_session, config.services['vk']['group_id']).listen():
             if event.type == VkBotEventType.MESSAGE_NEW:
                 if event.object.message['from_id'] == -config.services['vk']['group_id']: continue  # пропускаем сообщения от самого бота
-                asyncio.run_coroutine_threadsafe(message_navigator(service0='vk', msg_obj=event.object.message), loop)
+                asyncio.run_coroutine_threadsafe(message_navigator(service_from='vk', msg_obj=event.object.message), loop)
     except requests.exceptions.ReadTimeout as e:
         logger.warning(e)
         run_vk_bot_polling(loop)  # перезапуск при ошибке
     except Exception as e:
-        logger.critical(e, exc_info=True)
+        logger.error(e, exc_info=True)
         run_vk_bot_polling(loop)  # перезапуск при ошибке
 # === START ===
 async def main():
@@ -816,11 +936,13 @@ async def main():
     threading.Thread(target=run_vk_bot_polling, args=(loop,), daemon=True).start() 
     asyncio.create_task(message_sender())
     asyncio.create_task(message_buffer_worker())
+    asyncio.create_task(dc_bot.start(config.services['dc']['token']))
     await db.initialization()
-    if config.message_max_len + config.message_reply_max_len > 4000: logger.warning("message len limit in telegram is 4096 symbols. check limits in config file")
+    if config.message_max_len + config.message_reply_max_len > 4000: logger.warning("telegram message len limit is 4096 symbols. check limits in config file")
+    if config.attachments_max_size_mb > 8: logger.warning('discord file size limit is 8 MB. check limits in config file')
     if config.attachments_max_size_mb > 20: logger.warning('telegram file size limit is 20 MB. check limits in config file')
     logger.info("bot started")
-    await dp.start_polling(tg_bot)
+    await tg_dispatcher.start_polling(tg_bot)
     logger.warning("bot stopped")
 if __name__ == "__main__":
     asyncio.run(main())
