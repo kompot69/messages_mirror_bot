@@ -4,9 +4,9 @@ __pycache__/
 govno/
 venv/
 .env/
-.gitignore
 *.log
 *.txt
+!requirements.txt
 *.zip
 *.db
 config.py
